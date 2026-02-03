@@ -7,8 +7,7 @@ let package = Package(
     name: "recordit",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "recordit", targets: ["recordit"]),
-        .executable(name: "recordit-screen", targets: ["recorditScreen"])
+        .executable(name: "recordit", targets: ["recordit"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.7.0")
@@ -21,10 +20,6 @@ let package = Package(
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-        ),
-        .executableTarget(
-            name: "recorditScreen",
-            dependencies: []
         ),
         .testTarget(
             name: "recorditTests",

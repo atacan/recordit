@@ -1,12 +1,62 @@
+import ArgumentParser
 import AVFoundation
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
+import Darwin
 
-// Keep stdout clean for piping: put status/errors on stderr
-func log(_ message: String) {
-    let data = (message + "\n").data(using: .utf8)!
-    FileHandle.standardError.write(data)
+struct ScreenCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "screen",
+        abstract: "Record the primary display to a temporary file.")
+
+    @Option(help: "Stop recording after this many seconds. If omitted, press Ctrl-C to stop.")
+    var duration: Double?
+
+    mutating func run() async throws {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        guard let display = content.displays.first else {
+            log("No displays available for capture.")
+            throw ExitCode(2)
+        }
+
+        let filename = "recordit-screen-\(UUID().uuidString).mp4"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+
+        let recorder = try ScreenRecorder(outputURL: url, display: display)
+
+        let signalStream = AsyncStream<Void> { continuation in
+            signal(SIGINT, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+            source.setEventHandler {
+                continuation.yield()
+                continuation.finish()
+            }
+            source.resume()
+            continuation.onTermination = { _ in
+                source.cancel()
+            }
+        }
+
+        if let duration {
+            log("Screen recording… will stop automatically after \(duration) seconds (or Ctrl-C to stop).")
+        } else {
+            log("Screen recording… press Ctrl-C to stop.")
+        }
+        print(url.path())
+
+        try await recorder.start()
+
+        if let duration {
+            try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+        } else {
+            for await _ in signalStream {
+                break
+            }
+        }
+
+        try await recorder.stop()
+    }
 }
 
 final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
@@ -87,48 +137,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
             if !input.append(sampleBuffer) {
                 log("Failed to append sample buffer: \(writer.error?.localizedDescription ?? "unknown error")")
             }
-        }
-    }
-}
-
-@main
-struct RecorditScreen {
-    static func main() async {
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard let display = content.displays.first else {
-                log("No displays available for capture.")
-                exit(2)
-            }
-
-            let filename = "recordit-screen-\(UUID().uuidString).mp4"
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
-
-            let recorder = try ScreenRecorder(outputURL: url, display: display)
-
-            signal(SIGINT, SIG_IGN)
-            let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-            signalSource.setEventHandler {
-                Task {
-                    do {
-                        try await recorder.stop()
-                        exit(0)
-                    } catch {
-                        log("Error stopping: \(error)")
-                        exit(1)
-                    }
-                }
-            }
-            signalSource.resume()
-
-            log("Screen recording… press Ctrl-C to stop.")
-            print(url.path())
-
-            try await recorder.start()
-            dispatchMain()
-        } catch {
-            log("Error: \(error)")
-            exit(1)
         }
     }
 }
