@@ -5,6 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "recordit",
+    platforms: [.macOS(.v14)],
     products: [
     ],
     targets: [
