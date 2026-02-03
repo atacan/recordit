@@ -10,6 +10,29 @@ struct ScreenCommand: AsyncParsableCommand {
         commandName: "screen",
         abstract: "Record the primary display to a temporary file.")
 
+    enum VideoCodec: String, CaseIterable, ExpressibleByArgument {
+        case h264
+        case hevc
+        case prores
+
+        var avType: AVVideoCodecType {
+            switch self {
+            case .h264: return .h264
+            case .hevc: return .hevc
+            case .prores: return .proRes422
+            }
+        }
+
+        var fileType: AVFileType {
+            switch self {
+            case .prores:
+                return .mov
+            case .h264, .hevc:
+                return .mp4
+            }
+        }
+    }
+
     @Option(help: "Stop recording after this many seconds. If omitted, press Ctrl-C to stop.")
     var duration: Double?
 
@@ -27,6 +50,27 @@ struct ScreenCommand: AsyncParsableCommand {
 
     @Option(help: "Window ID or title substring to record.")
     var window: String?
+
+    @Option(help: "Frames per second. Default: 30.")
+    var fps: Double?
+
+    @Option(help: "Video codec. Default: h264.")
+    var codec: VideoCodec?
+
+    @Option(help: "Video bit rate in bps (applies to h264/hevc).")
+    var bitRate: Int?
+
+    @Option(help: "Scale factor (e.g. 0.5 for half size). Default: 1.")
+    var scale: Double?
+
+    @Flag(help: "Hide the cursor in the recording.")
+    var hideCursor = false
+
+    @Flag(help: "Show mouse click highlights.")
+    var showClicks = false
+
+    @Option(help: "Capture region as x,y,w,h. Values may be pixels, 0..1 fractions, or percentages (e.g. 10%,10%,80%,80%).")
+    var region: String?
 
     mutating func run() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -150,14 +194,86 @@ struct ScreenCommand: AsyncParsableCommand {
             throw ExitCode(2)
         }
 
+        let baseSize: CGSize
+        if let window = chosenWindow {
+            baseSize = window.frame.size
+        } else if let display = chosenDisplay {
+            baseSize = CGSize(width: display.width, height: display.height)
+        } else {
+            baseSize = CGSize(width: 1920, height: 1080)
+        }
+
+        if let fps, fps <= 0 {
+            throw ValidationError("FPS must be greater than 0.")
+        }
+        if let scale, scale <= 0 {
+            throw ValidationError("Scale must be greater than 0.")
+        }
+        if let bitRate, bitRate <= 0 {
+            throw ValidationError("Bit rate must be greater than 0.")
+        }
+
+        let regionRect = try region.map { try parseRegion($0, baseSize: baseSize) }
+        let targetSize = scaledSize(base: regionRect?.size ?? baseSize, scale: scale ?? 1.0)
+        let videoCodec = codec ?? .h264
+
         let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "recordit-screen-\(UUID().uuidString).mp4"
+            "recordit-screen-\(UUID().uuidString).\(videoCodec.fileType == .mov ? "mov" : "mp4")"
         )
+
+        let filter: SCContentFilter
+        if let window = chosenWindow {
+            filter = SCContentFilter(desktopIndependentWindow: window)
+        } else if let display = chosenDisplay {
+            filter = SCContentFilter(display: display, excludingWindows: [])
+        } else {
+            throw ValidationError("No display or window selected for capture.")
+        }
+
+        let config = SCStreamConfiguration()
+        config.width = Int(targetSize.width.rounded())
+        config.height = Int(targetSize.height.rounded())
+        config.pixelFormat = kCVPixelFormatType_32BGRA
+        config.queueDepth = 5
+        config.showsCursor = !hideCursor
+        if showClicks {
+            if #available(macOS 15.0, *) {
+                config.showMouseClicks = true
+            } else {
+                log("Mouse click highlights require macOS 15 or later; ignoring --show-clicks.")
+            }
+        }
+        if let fps {
+            config.minimumFrameInterval = CMTimeMakeWithSeconds(1.0 / fps, preferredTimescale: 600)
+        } else {
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
+        }
+        if let regionRect {
+            config.sourceRect = regionRect
+        }
+        if scale != nil && scale != 1.0 {
+            config.scalesToFit = true
+        }
+
+        var compression: [String: Any] = [:]
+        if let bitRate, videoCodec != .prores {
+            compression[AVVideoAverageBitRateKey] = bitRate
+        }
+        var outputSettings: [String: Any] = [
+            AVVideoCodecKey: videoCodec.avType,
+            AVVideoWidthKey: config.width,
+            AVVideoHeightKey: config.height
+        ]
+        if !compression.isEmpty {
+            outputSettings[AVVideoCompressionPropertiesKey] = compression
+        }
 
         let recorder = try ScreenRecorder(
             outputURL: outputURL,
-            display: chosenDisplay,
-            window: chosenWindow
+            fileType: videoCodec.fileType,
+            filter: filter,
+            configuration: config,
+            outputSettings: outputSettings
         )
 
         let signalStream = AsyncStream<Void> { continuation in
@@ -194,48 +310,84 @@ struct ScreenCommand: AsyncParsableCommand {
     }
 }
 
+private func scaledSize(base: CGSize, scale: Double) -> CGSize {
+    CGSize(width: max(1, base.width * scale), height: max(1, base.height * scale))
+}
+
+private func parseRegion(_ spec: String, baseSize: CGSize) throws -> CGRect {
+    let trimmed = spec.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    func parseComponent(_ token: String, base: Double) throws -> Double {
+        let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasSuffix("%") {
+            let value = String(t.dropLast())
+            guard let percent = Double(value) else {
+                throw ValidationError("Invalid percentage value '\(token)'.")
+            }
+            return base * (percent / 100.0)
+        }
+        guard let raw = Double(t) else {
+            throw ValidationError("Invalid numeric value '\(token)'.")
+        }
+        if raw >= 0 && raw <= 1 {
+            return base * raw
+        }
+        return raw
+    }
+
+    if trimmed.lowercased().hasPrefix("center:") {
+        let payload = trimmed.dropFirst("center:".count)
+        let parts = payload.split(separator: "x", maxSplits: 1, omittingEmptySubsequences: true)
+        guard parts.count == 2 else {
+            throw ValidationError("Center region must be formatted as center:WxH.")
+        }
+        let width = try parseComponent(String(parts[0]), base: baseSize.width)
+        let height = try parseComponent(String(parts[1]), base: baseSize.height)
+        guard width > 0, height > 0 else {
+            throw ValidationError("Region width and height must be greater than 0.")
+        }
+        let x = (baseSize.width - width) / 2
+        let y = (baseSize.height - height) / 2
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
+    let parts = trimmed.split(separator: ",").map { String($0) }
+    guard parts.count == 4 else {
+        throw ValidationError("Region must be formatted as x,y,w,h.")
+    }
+    let x = try parseComponent(parts[0], base: baseSize.width)
+    let y = try parseComponent(parts[1], base: baseSize.height)
+    let w = try parseComponent(parts[2], base: baseSize.width)
+    let h = try parseComponent(parts[3], base: baseSize.height)
+    guard w > 0, h > 0 else {
+        throw ValidationError("Region width and height must be greater than 0.")
+    }
+    let rect = CGRect(x: x, y: y, width: w, height: h)
+    guard rect.minX >= 0, rect.minY >= 0,
+          rect.maxX <= baseSize.width,
+          rect.maxY <= baseSize.height else {
+        throw ValidationError("Region is outside bounds for the selected capture source.")
+    }
+    return rect
+}
+
 final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private let stream: SCStream
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
     private let queue = DispatchQueue(label: "recordit.screen.capture")
 
-    init(outputURL: URL, display: SCDisplay?, window: SCWindow?) throws {
-        let filter: SCContentFilter
-        if let window {
-            filter = SCContentFilter(desktopIndependentWindow: window)
-        } else if let display {
-            filter = SCContentFilter(display: display, excludingWindows: [])
-        } else {
-            throw ValidationError("No display or window selected for capture.")
-        }
+    init(
+        outputURL: URL,
+        fileType: AVFileType,
+        filter: SCContentFilter,
+        configuration: SCStreamConfiguration,
+        outputSettings: [String: Any]
+    ) throws {
+        stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 
-        let config = SCStreamConfiguration()
-        if let display {
-            config.width = display.width
-            config.height = display.height
-        } else if let window {
-            config.width = Int(window.frame.size.width)
-            config.height = Int(window.frame.size.height)
-        } else {
-            config.width = 1920
-            config.height = 1080
-        }
-        config.pixelFormat = kCVPixelFormatType_32BGRA
-        config.queueDepth = 5
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-
-        stream = SCStream(filter: filter, configuration: config, delegate: nil)
-
-        writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        input = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: config.width,
-                AVVideoHeightKey: config.height
-            ]
-        )
+        writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
+        input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
         input.expectsMediaDataInRealTime = true
         if writer.canAdd(input) {
             writer.add(input)
