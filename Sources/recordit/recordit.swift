@@ -202,10 +202,10 @@ struct MicRec: AsyncParsableCommand {
     }
 
     func buildSettings() -> [String: Any] {
-        let resolvedFormat = format ?? .aac
+        let resolvedFormat = format ?? .linearPCM
         var settings: [String: Any] = [
             AVFormatIDKey: resolvedFormat.formatID,
-            AVSampleRateKey: sampleRate ?? 44_100,
+            AVSampleRateKey: sampleRate ?? 16000,
             AVNumberOfChannelsKey: channels ?? 1,
             AVEncoderAudioQualityKey: (quality ?? .high).avValue
         ]
