@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:recordit}",
+            "name": "Debug recordit",
+            "target": "recordit",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug recordit"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:recordit}",
+            "name": "Release recordit",
+            "target": "recordit",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release recordit"
+        }
+    ]
+}
