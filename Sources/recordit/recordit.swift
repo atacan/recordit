@@ -9,6 +9,11 @@ func log(_ message: String) {
     FileHandle.standardError.write(data)
 }
 
+enum StopReason: String, Codable {
+    case key
+    case duration
+}
+
 // Read single key without requiring Enter
 final class TerminalRawMode {
     private var original = termios()
@@ -80,20 +85,20 @@ final class AudioRecorder {
     }
 }
 
-func waitForStopKeyOrDuration(_ duration: Double?) async throws {
+func waitForStopKeyOrDuration(_ duration: Double?) async throws -> StopReason {
     let rawMode = TerminalRawMode()
     let deadline = duration.map { Date().addingTimeInterval($0) }
 
-    withExtendedLifetime(rawMode) {
+    return withExtendedLifetime(rawMode) {
         var buffer: UInt8 = 0
 
         while true {
             if Task.isCancelled {
-                return
+                return .key
             }
 
             if let deadline, deadline.timeIntervalSinceNow <= 0 {
-                return
+                return .duration
             }
 
             var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
@@ -111,7 +116,7 @@ func waitForStopKeyOrDuration(_ duration: Double?) async throws {
                 let count = read(STDIN_FILENO, &buffer, 1)
                 if count == 1 {
                     if buffer == UInt8(ascii: "s") || buffer == UInt8(ascii: "S") {
-                        return
+                        return .key
                     }
                 }
             }
@@ -121,6 +126,14 @@ func waitForStopKeyOrDuration(_ duration: Double?) async throws {
 
 @main
 struct MicRec: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Record audio from the default microphone to a temporary file.",
+        discussion: """
+        The output file path is printed to stdout (pipeline-friendly). Status messages \
+        go to stderr.
+        """
+    )
+
     enum AudioFormat: String, CaseIterable, ExpressibleByArgument {
         case aac
         case alac
@@ -168,22 +181,34 @@ struct MicRec: AsyncParsableCommand {
         }
     }
 
-    @Option(help: "Stop recording after this many seconds.")
+    @Option(help: "Stop recording after this many seconds. If omitted, press 'S' to stop.")
     var duration: Double?
 
-    @Option(help: "Sample rate in Hz.")
+    @Option(help: "Write output to this file or directory. Default: temporary directory.")
+    var output: String?
+
+    @Option(help: "Filename pattern when output is a directory. Supports strftime tokens and {uuid}. Default: micrec-%Y%m%d-%H%M%S.")
+    var name: String?
+
+    @Flag(help: "Overwrite output file if it exists.")
+    var overwrite = false
+
+    @Flag(help: "Print machine-readable JSON to stdout.")
+    var json = false
+
+    @Option(help: "Sample rate in Hz. Default: 44100.")
     var sampleRate: Double?
 
-    @Option(help: "Number of channels.")
+    @Option(help: "Number of channels. Default: 1.")
     var channels: Int?
 
-    @Option(help: "Encoder bit rate in bps.")
+    @Option(help: "Encoder bit rate in bps. Default: 128000. Ignored for linearPCM.")
     var bitRate: Int?
 
-    @Option(help: "Audio format.")
+    @Option(help: "Audio format. Default: linearPCM.")
     var format: AudioFormat?
 
-    @Option(help: "Encoder quality.")
+    @Option(help: "Encoder quality. Default: high.")
     var quality: AudioQuality?
 
     mutating func validate() throws {
@@ -205,15 +230,17 @@ struct MicRec: AsyncParsableCommand {
         let resolvedFormat = format ?? .linearPCM
         var settings: [String: Any] = [
             AVFormatIDKey: resolvedFormat.formatID,
-            AVSampleRateKey: sampleRate ?? 16000,
+            AVSampleRateKey: sampleRate ?? 44_100,
             AVNumberOfChannelsKey: channels ?? 1,
             AVEncoderAudioQualityKey: (quality ?? .high).avValue
         ]
 
-        if let bitRate {
-            settings[AVEncoderBitRateKey] = bitRate
-        } else {
-            settings[AVEncoderBitRateKey] = 128_000
+        if resolvedFormat != .linearPCM {
+            if let bitRate {
+                settings[AVEncoderBitRateKey] = bitRate
+            } else {
+                settings[AVEncoderBitRateKey] = 128_000
+            }
         }
 
         if resolvedFormat == .linearPCM {
@@ -223,6 +250,63 @@ struct MicRec: AsyncParsableCommand {
         }
 
         return settings
+    }
+
+    func formatFilename(pattern: String, date: Date, uuid: UUID) -> String {
+        var t = time_t(date.timeIntervalSince1970)
+        var tm = tm()
+        localtime_r(&t, &tm)
+
+        var buffer = [CChar](repeating: 0, count: 256)
+        let count = strftime(&buffer, buffer.count, pattern, &tm)
+        if count == 0 {
+            return "micrec-\(uuid.uuidString)"
+        }
+
+        let bytes = buffer.prefix(count).map { UInt8(bitPattern: $0) }
+        let base = String(bytes: bytes, encoding: .utf8) ?? "micrec-\(uuid.uuidString)"
+        return base.replacingOccurrences(of: "{uuid}", with: uuid.uuidString)
+    }
+
+    func resolveOutputURL(extension fileExtension: String) throws -> URL {
+        let fileManager = FileManager.default
+        let uuid = UUID()
+        let pattern = name ?? "micrec-%Y%m%d-%H%M%S"
+
+        func ensureExtension(_ filename: String) -> String {
+            let url = URL(fileURLWithPath: filename)
+            if url.pathExtension.isEmpty {
+                return filename + "." + fileExtension
+            }
+            return filename
+        }
+
+        if let output {
+            let outputURL = URL(fileURLWithPath: output)
+            var isDirectory: ObjCBool = false
+            if fileManager.fileExists(atPath: outputURL.path, isDirectory: &isDirectory) {
+                if isDirectory.boolValue {
+                    let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid)
+                    return outputURL.appendingPathComponent(ensureExtension(filename))
+                }
+                return URL(fileURLWithPath: ensureExtension(outputURL.path))
+            }
+
+            if output.hasSuffix("/") {
+                try fileManager.createDirectory(at: outputURL, withIntermediateDirectories: true)
+                let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid)
+                return outputURL.appendingPathComponent(ensureExtension(filename))
+            }
+
+            if outputURL.pathExtension.isEmpty {
+                return URL(fileURLWithPath: ensureExtension(outputURL.path))
+            }
+            return outputURL
+        }
+
+        let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid)
+        let tempDir = fileManager.temporaryDirectory
+        return tempDir.appendingPathComponent(ensureExtension(filename))
     }
 
     mutating func run() async throws {
@@ -240,9 +324,12 @@ struct MicRec: AsyncParsableCommand {
             }
 
             let settings = buildSettings()
-            let extensionOverride = (format ?? .aac).fileExtension
-            let filename = "micrec-\(UUID().uuidString).\(extensionOverride)"
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent(filename)
+            let extensionOverride = (format ?? .linearPCM).fileExtension
+            let url = try resolveOutputURL(extension: extensionOverride)
+
+            if !overwrite && FileManager.default.fileExists(atPath: url.path) {
+                throw ValidationError("Output file already exists. Use --overwrite to replace it.")
+            }
 
             let recorder = await MainActor.run { AudioRecorder(outputURL: url, settings: settings) }
             try await MainActor.run { try recorder.start() }
@@ -253,12 +340,40 @@ struct MicRec: AsyncParsableCommand {
                 log("Recording… press 'S' to stop.")
             }
 
-            try await waitForStopKeyOrDuration(duration)
+            let stopReason = try await waitForStopKeyOrDuration(duration)
 
             await MainActor.run { recorder.stop() }
 
             // stdout: print ONLY the URL (pipeline-friendly)
-            print(url.path())
+            if json {
+                struct Output: Codable {
+                    let path: String
+                    let format: String
+                    let sampleRate: Double
+                    let channels: Int
+                    let bitRate: Int?
+                    let quality: String
+                    let duration: Double?
+                    let stopReason: StopReason
+                }
+
+                let resolvedFormat = (format ?? .linearPCM)
+                let out = Output(
+                    path: url.path,
+                    format: resolvedFormat.rawValue,
+                    sampleRate: sampleRate ?? 44_100,
+                    channels: channels ?? 1,
+                    bitRate: resolvedFormat == .linearPCM ? nil : (bitRate ?? 128_000),
+                    quality: (quality ?? .high).rawValue,
+                    duration: duration,
+                    stopReason: stopReason
+                )
+                let data = try JSONEncoder().encode(out)
+                FileHandle.standardOutput.write(data)
+                FileHandle.standardOutput.write(Data("\n".utf8))
+            } else {
+                print(url.path())
+            }
         } catch {
             log("Error: \(error)")
             throw ExitCode(1)
