@@ -33,8 +33,24 @@ struct ScreenCommand: AsyncParsableCommand {
         }
     }
 
+    enum ScreenAudio: String, CaseIterable, ExpressibleByArgument {
+        case none
+        case system
+        case mic
+        case both
+    }
+
     @Option(help: "Stop recording after this many seconds. If omitted, press Ctrl-C to stop.")
     var duration: Double?
+
+    @Option(help: "Write output to this file or directory. Default: temporary directory.")
+    var output: String?
+
+    @Option(help: "Filename pattern when output is a directory. Supports strftime tokens, {uuid}, and {chunk}.")
+    var name: String?
+
+    @Flag(help: "Overwrite output file if it exists.")
+    var overwrite = false
 
     @Flag(help: "List available displays and exit.")
     var listDisplays = false
@@ -50,6 +66,21 @@ struct ScreenCommand: AsyncParsableCommand {
 
     @Option(help: "Window ID or title substring to record.")
     var window: String?
+
+    @Option(help: "Stop key (single ASCII character). Default: s.")
+    var stopKey: String?
+
+    @Option(help: "Pause key (single ASCII character). Default: p. If same as resume key, toggles pause/resume.")
+    var pauseKey: String?
+
+    @Option(help: "Resume key (single ASCII character). Default: r. If same as pause key, toggles pause/resume.")
+    var resumeKey: String?
+
+    @Option(help: "Stop when output file reaches this size in MB.")
+    var maxSizeMB: Double?
+
+    @Option(help: "Split recording into chunks of this many seconds. Output must be a directory.")
+    var split: Double?
 
     @Option(help: "Frames per second. Default: 30.")
     var fps: Double?
@@ -71,6 +102,15 @@ struct ScreenCommand: AsyncParsableCommand {
 
     @Option(help: "Capture region as x,y,w,h. Values may be pixels, 0..1 fractions, or percentages (e.g. 10%,10%,80%,80%).")
     var region: String?
+
+    @Option(help: "Audio capture: none, system, mic, or both. Default: none.")
+    var audio: ScreenAudio?
+
+    @Option(help: "Audio sample rate. Default: 48000.")
+    var audioSampleRate: Int?
+
+    @Option(help: "Audio channel count. Default: 2.")
+    var audioChannels: Int?
 
     mutating func run() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
@@ -194,15 +234,35 @@ struct ScreenCommand: AsyncParsableCommand {
             throw ExitCode(2)
         }
 
-        let baseSize: CGSize
-        if let window = chosenWindow {
-            baseSize = window.frame.size
-        } else if let display = chosenDisplay {
-            baseSize = CGSize(width: display.width, height: display.height)
-        } else {
-            baseSize = CGSize(width: 1920, height: 1080)
-        }
+        let stopKeyValue = stopKey ?? "s"
+        let pauseKeyValue = pauseKey ?? "p"
+        let resumeKeyValue = resumeKey ?? "r"
+        let togglePauseResume = pauseKeyValue.caseInsensitiveCompare(resumeKeyValue) == .orderedSame
+        let stopKeys = try resolveKeySet(stopKeyValue, label: "Stop key")
+        let pauseKeys = try resolveKeySet(pauseKeyValue, label: "Pause key")
+        let resumeKeys = try resolveKeySet(resumeKeyValue, label: "Resume key")
+        let stopKeyDisplay = stopKeyValue.uppercased()
+        let pauseKeyDisplay = pauseKeyValue.uppercased()
+        let resumeKeyDisplay = resumeKeyValue.uppercased()
 
+        if !stopKeys.isDisjoint(with: pauseKeys) {
+            throw ValidationError("Stop key and pause key must be different.")
+        }
+        if !stopKeys.isDisjoint(with: resumeKeys) {
+            throw ValidationError("Stop key and resume key must be different.")
+        }
+        if !togglePauseResume, !pauseKeys.isDisjoint(with: resumeKeys) {
+            throw ValidationError("Pause key and resume key must be different unless you want a toggle.")
+        }
+        if let duration, duration <= 0 {
+            throw ValidationError("Duration must be greater than 0 seconds.")
+        }
+        if let split, split <= 0 {
+            throw ValidationError("Split duration must be greater than 0 seconds.")
+        }
+        if let maxSizeMB, maxSizeMB <= 0 {
+            throw ValidationError("Max size must be greater than 0 MB.")
+        }
         if let fps, fps <= 0 {
             throw ValidationError("FPS must be greater than 0.")
         }
@@ -212,14 +272,27 @@ struct ScreenCommand: AsyncParsableCommand {
         if let bitRate, bitRate <= 0 {
             throw ValidationError("Bit rate must be greater than 0.")
         }
+        if let audioSampleRate, audioSampleRate <= 0 {
+            throw ValidationError("Audio sample rate must be greater than 0.")
+        }
+        if let audioChannels, audioChannels <= 0 {
+            throw ValidationError("Audio channels must be greater than 0.")
+        }
+
+        let maxSizeBytes = maxSizeMB.map { Int64($0 * 1_048_576) }
+
+        let baseSize: CGSize
+        if let window = chosenWindow {
+            baseSize = window.frame.size
+        } else if let display = chosenDisplay {
+            baseSize = CGSize(width: display.width, height: display.height)
+        } else {
+            baseSize = CGSize(width: 1920, height: 1080)
+        }
 
         let regionRect = try region.map { try parseRegion($0, baseSize: baseSize) }
         let targetSize = scaledSize(base: regionRect?.size ?? baseSize, scale: scale ?? 1.0)
         let videoCodec = codec ?? .h264
-
-        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(
-            "recordit-screen-\(UUID().uuidString).\(videoCodec.fileType == .mov ? "mov" : "mp4")"
-        )
 
         let filter: SCContentFilter
         if let window = chosenWindow {
@@ -255,6 +328,36 @@ struct ScreenCommand: AsyncParsableCommand {
             config.scalesToFit = true
         }
 
+        let audioMode = audio ?? .none
+        let audioSampleRateValue = audioSampleRate ?? 48_000
+        let audioChannelsValue = audioChannels ?? 2
+        var captureAudio = false
+        var audioSettings: [String: Any]?
+
+        if audioMode != .none {
+            if audioMode == .system || audioMode == .both {
+                config.capturesAudio = true
+                captureAudio = true
+            }
+            if audioMode == .mic || audioMode == .both {
+                if #available(macOS 15.0, *) {
+                    config.captureMicrophone = true
+                    captureAudio = true
+                } else {
+                    log("Microphone capture requires macOS 15 or later; ignoring mic audio.")
+                }
+            }
+            config.sampleRate = audioSampleRateValue
+            config.channelCount = audioChannelsValue
+            audioSettings = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRateValue,
+                AVNumberOfChannelsKey: audioChannelsValue,
+                AVEncoderBitRateKey: 128_000
+            ]
+        }
+        let effectiveAudioMode: ScreenAudio = captureAudio ? audioMode : .none
+
         var compression: [String: Any] = [:]
         if let bitRate, videoCodec != .prores {
             compression[AVVideoAverageBitRateKey] = bitRate
@@ -268,45 +371,138 @@ struct ScreenCommand: AsyncParsableCommand {
             outputSettings[AVVideoCompressionPropertiesKey] = compression
         }
 
-        let recorder = try ScreenRecorder(
-            outputURL: outputURL,
-            fileType: videoCodec.fileType,
-            filter: filter,
-            configuration: config,
-            outputSettings: outputSettings
-        )
+        let shouldSplit = split != nil
+        let overallDeadline = duration.map { Date().addingTimeInterval($0) }
+        var chunkIndex = 1
 
-        let signalStream = AsyncStream<Void> { continuation in
-            signal(SIGINT, SIG_IGN)
-            let source = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-            source.setEventHandler {
-                continuation.yield()
-                continuation.finish()
-            }
-            source.resume()
-            continuation.onTermination = { _ in
-                source.cancel()
-            }
+        let stopFlag = AtomicBool()
+        signal(SIGINT, SIG_IGN)
+        let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        signalSource.setEventHandler {
+            stopFlag.set()
         }
+        signalSource.resume()
+        defer { signalSource.cancel() }
 
-        if let duration {
-            log("Screen recording… will stop automatically after \(duration) seconds (or Ctrl-C to stop).")
-        } else {
-            log("Screen recording… press Ctrl-C to stop.")
-        }
-        print(outputURL.path())
-
-        try await recorder.start()
-
-        if let duration {
-            try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
-        } else {
-            for await _ in signalStream {
+        while true {
+            if let overallDeadline, overallDeadline <= Date() {
                 break
             }
-        }
 
-        try await recorder.stop()
+            let outputURL = try resolveOutputURL(
+                output: output,
+                name: name,
+                fileExtension: (videoCodec.fileType == .mov ? "mov" : "mp4"),
+                chunkIndex: shouldSplit ? chunkIndex : nil,
+                requireDirectory: shouldSplit
+            )
+
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                if overwrite {
+                    try FileManager.default.removeItem(at: outputURL)
+                } else {
+                    throw ValidationError("Output file already exists. Use --overwrite to replace it.")
+                }
+            }
+
+            let recorder = try ScreenRecorder(
+                outputURL: outputURL,
+                fileType: videoCodec.fileType,
+                filter: filter,
+                configuration: config,
+                outputSettings: outputSettings,
+                audioSettings: audioSettings,
+                captureAudio: captureAudio
+            )
+
+            var stopMessage = "press '\(stopKeyDisplay)' to stop"
+            if pauseKeyValue != stopKeyValue && resumeKeyValue != stopKeyValue {
+                if togglePauseResume {
+                    stopMessage += ", '\(pauseKeyDisplay)' to pause/resume"
+                } else {
+                    stopMessage += ", '\(pauseKeyDisplay)' to pause, '\(resumeKeyDisplay)' to resume"
+                }
+            }
+            if let split {
+                stopMessage += ", split every \(split)s"
+            }
+            if let maxSizeMB {
+                stopMessage += " or when file reaches \(maxSizeMB) MB"
+            }
+
+            let chunkLabel = shouldSplit ? " (chunk \(chunkIndex))" : ""
+            if let duration {
+                log("Screen recording\(chunkLabel)… will stop automatically after \(duration) seconds or when you \(stopMessage).")
+            } else {
+                log("Screen recording\(chunkLabel)… \(stopMessage).")
+            }
+            if !json {
+                print(outputURL.path())
+            }
+
+            try await recorder.start()
+
+            let remainingDuration = overallDeadline.map { max(0, $0.timeIntervalSinceNow) }
+            let stopReason = try await waitForStopKeyOrDuration(
+                remainingDuration,
+                splitDuration: split,
+                stopKeys: stopKeys,
+                pauseKeys: pauseKeys,
+                resumeKeys: resumeKeys,
+                pauseKeyDisplay: pauseKeyDisplay,
+                resumeKeyDisplay: resumeKeyDisplay,
+                togglePauseResume: togglePauseResume,
+                maxSizeBytes: maxSizeBytes,
+                outputURL: outputURL,
+                stopFlag: stopFlag,
+                recorder: recorder
+            )
+
+            try await recorder.stop()
+
+            if json {
+                struct Output: Codable {
+                    let path: String
+                    let codec: String
+                    let fps: Double
+                    let bitRate: Int?
+                    let scale: Double
+                    let audio: String
+                    let audioSampleRate: Int?
+                    let audioChannels: Int?
+                    let duration: Double?
+                    let maxSizeMB: Double?
+                    let split: Double?
+                    let chunk: Int
+                    let stopReason: StopReason
+                }
+
+                let out = Output(
+                    path: outputURL.path,
+                    codec: videoCodec.rawValue,
+                    fps: fps ?? 30,
+                    bitRate: bitRate,
+                    scale: scale ?? 1.0,
+                    audio: effectiveAudioMode.rawValue,
+                    audioSampleRate: effectiveAudioMode == .none ? nil : audioSampleRateValue,
+                    audioChannels: effectiveAudioMode == .none ? nil : audioChannelsValue,
+                    duration: duration,
+                    maxSizeMB: maxSizeMB,
+                    split: split,
+                    chunk: chunkIndex,
+                    stopReason: stopReason
+                )
+                let data = try JSONEncoder().encode(out)
+                FileHandle.standardOutput.write(data)
+                FileHandle.standardOutput.write(Data("\n".utf8))
+            }
+
+            if stopReason == .split {
+                chunkIndex += 1
+                continue
+            }
+            break
+        }
     }
 }
 
@@ -371,18 +567,237 @@ private func parseRegion(_ spec: String, baseSize: CGSize) throws -> CGRect {
     return rect
 }
 
+private final class AtomicBool {
+    private let lock = NSLock()
+    private var value = false
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        let current = value
+        lock.unlock()
+        return current
+    }
+}
+
+private func resolveKeySet(_ key: String, label: String) throws -> Set<UInt8> {
+    guard key.count == 1, let scalar = key.unicodeScalars.first, scalar.isASCII else {
+        throw ValidationError("\(label) must be a single ASCII character.")
+    }
+
+    var keys: Set<UInt8> = [UInt8(scalar.value)]
+    if scalar.properties.isAlphabetic {
+        if let upper = key.uppercased().unicodeScalars.first {
+            keys.insert(UInt8(upper.value))
+        }
+        if let lower = key.lowercased().unicodeScalars.first {
+            keys.insert(UInt8(lower.value))
+        }
+    }
+    return keys
+}
+
+private func formatFilename(pattern: String, date: Date, uuid: UUID, chunkIndex: Int?) -> String {
+    var t = time_t(date.timeIntervalSince1970)
+    var tm = tm()
+    localtime_r(&t, &tm)
+
+    var buffer = [CChar](repeating: 0, count: 256)
+    let count = strftime(&buffer, buffer.count, pattern, &tm)
+    if count == 0 {
+        return "recordit-screen-\(uuid.uuidString)"
+    }
+
+    let bytes = buffer.prefix(count).map { UInt8(bitPattern: $0) }
+    let base = String(bytes: bytes, encoding: .utf8) ?? "recordit-screen-\(uuid.uuidString)"
+    var result = base.replacingOccurrences(of: "{uuid}", with: uuid.uuidString)
+    if let chunkIndex {
+        result = result.replacingOccurrences(of: "{chunk}", with: String(chunkIndex))
+    }
+    return result
+}
+
+private func resolveOutputURL(
+    output: String?,
+    name: String?,
+    fileExtension: String,
+    chunkIndex: Int?,
+    requireDirectory: Bool
+) throws -> URL {
+    let fileManager = FileManager.default
+    let uuid = UUID()
+    let defaultPattern = (chunkIndex == nil) ? "recordit-screen-%Y%m%d-%H%M%S" : "recordit-screen-%Y%m%d-%H%M%S-{chunk}"
+    let pattern = name ?? defaultPattern
+
+    func ensureExtension(_ filename: String) -> String {
+        let url = URL(fileURLWithPath: filename)
+        if url.pathExtension.isEmpty {
+            return filename + "." + fileExtension
+        }
+        return filename
+    }
+
+    if let output {
+        let outputURL = URL(fileURLWithPath: output)
+        var isDirectory: ObjCBool = false
+        if fileManager.fileExists(atPath: outputURL.path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue {
+                let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid, chunkIndex: chunkIndex)
+                return outputURL.appendingPathComponent(ensureExtension(filename))
+            }
+            if requireDirectory {
+                throw ValidationError("Output must be a directory when using --split.")
+            }
+            return URL(fileURLWithPath: ensureExtension(outputURL.path))
+        }
+
+        if output.hasSuffix("/") {
+            try fileManager.createDirectory(at: outputURL, withIntermediateDirectories: true)
+            let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid, chunkIndex: chunkIndex)
+            return outputURL.appendingPathComponent(ensureExtension(filename))
+        }
+
+        if requireDirectory {
+            if !outputURL.pathExtension.isEmpty {
+                throw ValidationError("Output must be a directory when using --split.")
+            }
+            try fileManager.createDirectory(at: outputURL, withIntermediateDirectories: true)
+            let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid, chunkIndex: chunkIndex)
+            return outputURL.appendingPathComponent(ensureExtension(filename))
+        }
+
+        if outputURL.pathExtension.isEmpty {
+            return URL(fileURLWithPath: ensureExtension(outputURL.path))
+        }
+        return outputURL
+    }
+
+    let filename = formatFilename(pattern: pattern, date: Date(), uuid: uuid, chunkIndex: chunkIndex)
+    let tempDir = fileManager.temporaryDirectory
+    return tempDir.appendingPathComponent(ensureExtension(filename))
+}
+
+private func waitForStopKeyOrDuration(
+    _ duration: Double?,
+    splitDuration: Double?,
+    stopKeys: Set<UInt8>,
+    pauseKeys: Set<UInt8>,
+    resumeKeys: Set<UInt8>,
+    pauseKeyDisplay: String,
+    resumeKeyDisplay: String,
+    togglePauseResume: Bool,
+    maxSizeBytes: Int64?,
+    outputURL: URL?,
+    stopFlag: AtomicBool,
+    recorder: ScreenRecorder?
+) async throws -> StopReason {
+    let rawMode = TerminalRawMode()
+    defer { _ = rawMode }
+
+    let deadline = duration.map { Date().addingTimeInterval($0) }
+    var splitRemaining = splitDuration
+    let sizeInterval: TimeInterval = 0.5
+    var nextSizeCheck = Date()
+    let fileManager = FileManager.default
+    var buffer: UInt8 = 0
+    var isPaused = false
+    var lastTick = Date()
+
+    while true {
+        if stopFlag.get() || Task.isCancelled {
+            return .key
+        }
+
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastTick)
+        lastTick = now
+
+        if let deadline, now >= deadline {
+            return .duration
+        }
+        if let remaining = splitRemaining, !isPaused {
+            let updated = remaining - elapsed
+            splitRemaining = updated
+            if updated <= 0 {
+                return .split
+            }
+        }
+
+        if let maxSizeBytes, let outputURL, now >= nextSizeCheck {
+            if let attrs = try? fileManager.attributesOfItem(atPath: outputURL.path),
+               let size = attrs[.size] as? NSNumber,
+               size.int64Value >= maxSizeBytes {
+                return .maxSize
+            }
+            nextSizeCheck = now.addingTimeInterval(sizeInterval)
+        }
+
+        var timeout = 0.25
+        if let deadline {
+            timeout = min(timeout, max(0, deadline.timeIntervalSince(now)))
+        }
+        if let splitRemaining, !isPaused {
+            timeout = min(timeout, max(0, splitRemaining))
+        }
+        if maxSizeBytes != nil, outputURL != nil {
+            timeout = min(timeout, max(0, nextSizeCheck.timeIntervalSince(now)))
+        }
+        let timeoutMs = Int32(max(1, Int(timeout * 1000)))
+
+        var fds = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        let ready = poll(&fds, 1, timeoutMs)
+        if ready > 0 && (fds.revents & Int16(POLLIN)) != 0 {
+            let count = read(STDIN_FILENO, &buffer, 1)
+            if count == 1 {
+                if stopKeys.contains(buffer) {
+                    return .key
+                }
+                if togglePauseResume && pauseKeys.contains(buffer) {
+                    if isPaused {
+                        recorder?.setPaused(false)
+                        isPaused = false
+                        log("Resumed. Press '\(pauseKeyDisplay)' to pause.")
+                    } else {
+                        recorder?.setPaused(true)
+                        isPaused = true
+                        log("Paused. Press '\(pauseKeyDisplay)' to resume.")
+                    }
+                } else if pauseKeys.contains(buffer), !isPaused {
+                    recorder?.setPaused(true)
+                    isPaused = true
+                    log("Paused. Press '\(resumeKeyDisplay)' to resume.")
+                } else if resumeKeys.contains(buffer), isPaused {
+                    recorder?.setPaused(false)
+                    isPaused = false
+                    log("Resumed.")
+                }
+            }
+        }
+    }
+}
+
 final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private let stream: SCStream
     private let writer: AVAssetWriter
     private let input: AVAssetWriterInput
+    private let audioInput: AVAssetWriterInput?
     private let queue = DispatchQueue(label: "recordit.screen.capture")
+    private let stateLock = NSLock()
+    private var paused = false
 
     init(
         outputURL: URL,
         fileType: AVFileType,
         filter: SCContentFilter,
         configuration: SCStreamConfiguration,
-        outputSettings: [String: Any]
+        outputSettings: [String: Any],
+        audioSettings: [String: Any]?,
+        captureAudio: Bool
     ) throws {
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
 
@@ -397,9 +812,26 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
             ])
         }
 
+        if captureAudio, let audioSettings {
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            audioInput.expectsMediaDataInRealTime = true
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+                self.audioInput = audioInput
+            } else {
+                self.audioInput = nil
+                log("Unable to add audio writer input; continuing without audio.")
+            }
+        } else {
+            audioInput = nil
+        }
+
         super.init()
 
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if captureAudio {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+        }
     }
 
     func start() async throws {
@@ -409,6 +841,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     func stop() async throws {
         try await stream.stopCapture()
         input.markAsFinished()
+        audioInput?.markAsFinished()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             writer.finishWriting {
                 if let error = self.writer.error {
@@ -421,8 +854,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
+        guard type == .screen || type == .audio else { return }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+        if isPaused() { return }
 
         if writer.status == .unknown {
             let startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -435,10 +869,31 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
             return
         }
 
-        if input.isReadyForMoreMediaData {
-            if !input.append(sampleBuffer) {
-                log("Failed to append sample buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+        if type == .screen {
+            if input.isReadyForMoreMediaData {
+                if !input.append(sampleBuffer) {
+                    log("Failed to append video buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                }
+            }
+        } else if type == .audio, let audioInput {
+            if audioInput.isReadyForMoreMediaData {
+                if !audioInput.append(sampleBuffer) {
+                    log("Failed to append audio buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                }
             }
         }
+    }
+
+    func setPaused(_ paused: Bool) {
+        stateLock.lock()
+        self.paused = paused
+        stateLock.unlock()
+    }
+
+    private func isPaused() -> Bool {
+        stateLock.lock()
+        let value = paused
+        stateLock.unlock()
+        return value
     }
 }
