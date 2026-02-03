@@ -42,7 +42,7 @@ swift build
   - `--list-formats` and `--list-qualities` print available values and exit.
 - Stop controls:
   - `--stop-key` sets the single-key stop shortcut (ASCII, case-insensitive).
-  - `--pause-key` and `--resume-key` control pausing/resuming.
+  - `--pause-key` and `--resume-key` control pausing/resuming; if identical, the key toggles.
   - `--silence-db` + `--silence-duration` stops after continuous silence.
 
 ## Testing notes

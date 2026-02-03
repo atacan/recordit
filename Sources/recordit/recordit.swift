@@ -247,6 +247,7 @@ func waitForStopKeyOrDuration(
     resumeKeys: Set<UInt8>,
     pauseKeyDisplay: String,
     resumeKeyDisplay: String,
+    togglePauseResume: Bool,
     silence: SilenceConfig?,
     recorder: AudioRecorder?
 ) async throws -> StopReason {
@@ -303,7 +304,21 @@ func waitForStopKeyOrDuration(
                 if stopKeys.contains(buffer) {
                     return .key
                 }
-                if pauseKeys.contains(buffer), !isPaused {
+                if togglePauseResume && pauseKeys.contains(buffer) {
+                    if isPaused {
+                        if let recorder {
+                            await MainActor.run { recorder.resume() }
+                        }
+                        isPaused = false
+                        log("Resumed. Press '\(pauseKeyDisplay)' to pause.")
+                    } else {
+                        if let recorder {
+                            await MainActor.run { recorder.pause() }
+                        }
+                        isPaused = true
+                        log("Paused. Press '\(pauseKeyDisplay)' to resume.")
+                    }
+                } else if pauseKeys.contains(buffer), !isPaused {
                     if let recorder {
                         await MainActor.run { recorder.pause() }
                     }
@@ -408,10 +423,10 @@ struct MicRec: AsyncParsableCommand {
     @Option(help: "Stop key (single ASCII character). Default: s.")
     var stopKey: String?
 
-    @Option(help: "Pause key (single ASCII character). Default: p.")
+    @Option(help: "Pause key (single ASCII character). Default: p. If same as resume key, toggles pause/resume.")
     var pauseKey: String?
 
-    @Option(help: "Resume key (single ASCII character). Default: r.")
+    @Option(help: "Resume key (single ASCII character). Default: r. If same as pause key, toggles pause/resume.")
     var resumeKey: String?
 
     @Option(help: "Silence threshold in dBFS (e.g. -50). Requires --silence-duration.")
@@ -452,8 +467,9 @@ struct MicRec: AsyncParsableCommand {
         if !stopSet.isDisjoint(with: resumeSet) {
             throw ValidationError("Stop key and resume key must be different.")
         }
-        if !pauseSet.isDisjoint(with: resumeSet) {
-            throw ValidationError("Pause key and resume key must be different.")
+        let pauseEqualsResume = pauseKeyValue.caseInsensitiveCompare(resumeKeyValue) == .orderedSame
+        if !pauseEqualsResume, !pauseSet.isDisjoint(with: resumeSet) {
+            throw ValidationError("Pause key and resume key must be different unless you want a toggle.")
         }
         if (silenceDB == nil) != (silenceDuration == nil) {
             throw ValidationError("Both --silence-db and --silence-duration must be provided together.")
@@ -676,6 +692,7 @@ struct MicRec: AsyncParsableCommand {
             let stopKeyValue = stopKey ?? "s"
             let pauseKeyValue = pauseKey ?? "p"
             let resumeKeyValue = resumeKey ?? "r"
+            let togglePauseResume = pauseKeyValue.caseInsensitiveCompare(resumeKeyValue) == .orderedSame
             let stopKeys = try resolveKeySet(stopKeyValue, label: "Stop key")
             let pauseKeys = try resolveKeySet(pauseKeyValue, label: "Pause key")
             let resumeKeys = try resolveKeySet(resumeKeyValue, label: "Resume key")
@@ -705,7 +722,11 @@ struct MicRec: AsyncParsableCommand {
 
             var stopMessage = "press '\(stopKeyDisplay)' to stop"
             if pauseKeyValue != stopKeyValue && resumeKeyValue != stopKeyValue {
-                stopMessage += ", '\(pauseKeyDisplay)' to pause, '\(resumeKeyDisplay)' to resume"
+                if togglePauseResume {
+                    stopMessage += ", '\(pauseKeyDisplay)' to pause/resume"
+                } else {
+                    stopMessage += ", '\(pauseKeyDisplay)' to pause, '\(resumeKeyDisplay)' to resume"
+                }
             }
             if let silenceConfig {
                 stopMessage += " or after \(silenceConfig.duration)s of silence (\(silenceConfig.db)dB)"
@@ -723,6 +744,7 @@ struct MicRec: AsyncParsableCommand {
                 resumeKeys: resumeKeys,
                 pauseKeyDisplay: pauseKeyDisplay,
                 resumeKeyDisplay: resumeKeyDisplay,
+                togglePauseResume: togglePauseResume,
                 silence: silenceConfig,
                 recorder: recorder
             )
