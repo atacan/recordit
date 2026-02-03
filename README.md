@@ -19,7 +19,7 @@ The command prints the output file path to stdout. Status messages go to stderr 
 ## Usage
 
 ```bash
-recordit [--duration <seconds>] [--output <path>] [--name <pattern>] [--overwrite] [--json] [--sample-rate <hz>] [--channels <count>] [--bit-rate <bps>] [--format <format>] [--quality <quality>]
+recordit [--duration <seconds>] [--output <path>] [--name <pattern>] [--overwrite] [--json] [--list-devices] [--list-formats] [--list-qualities] [--device <device>] [--sample-rate <hz>] [--channels <count>] [--bit-rate <bps>] [--format <format>] [--quality <quality>]
 ```
 
 ## Options
@@ -29,6 +29,10 @@ recordit [--duration <seconds>] [--output <path>] [--name <pattern>] [--overwrit
 - `--name <pattern>`: Filename pattern when output is a directory. Supports strftime tokens and `{uuid}`. Default: `micrec-%Y%m%d-%H%M%S`.
 - `--overwrite`: Overwrite output file if it exists.
 - `--json`: Print machine-readable JSON to stdout.
+- `--list-devices`: List available input devices and exit.
+- `--list-formats`: List available audio formats and exit.
+- `--list-qualities`: List available encoder qualities and exit.
+- `--device <device>`: Input device UID or name to use for recording.
 - `--sample-rate <hz>`: Sample rate in Hz. Default: `44100`.
 - `--channels <count>`: Number of channels. Default: `1`.
 - `--bit-rate <bps>`: Encoder bit rate in bps. Default: `128000`. Ignored for `linearPCM`.
@@ -46,6 +50,9 @@ File extension mapping:
 
 ```bash
 recordit --duration 5
+recordit --list-devices
+recordit --list-formats --json
+recordit --device "MacBook Pro Microphone" --duration 10
 recordit --output /tmp --name "micrec-%Y%m%d-%H%M%S-{uuid}"
 recordit --output /tmp/meeting.caf --overwrite
 recordit --duration 5 --json

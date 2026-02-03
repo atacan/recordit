@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import ArgumentParser
+import CoreAudio
 import Foundation
 import Darwin
 
@@ -12,6 +13,12 @@ func log(_ message: String) {
 enum StopReason: String, Codable {
     case key
     case duration
+}
+
+struct AudioInputDevice: Codable {
+    let id: AudioDeviceID
+    let uid: String
+    let name: String
 }
 
 // Read single key without requiring Enter
@@ -54,6 +61,131 @@ func requestMicrophonePermission() async -> Bool {
     @unknown default:
         return false
     }
+}
+
+func defaultInputDeviceID() throws -> AudioDeviceID {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    var deviceID = AudioDeviceID(0)
+    var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &dataSize,
+        &deviceID
+    )
+    guard status == noErr else {
+        throw ValidationError("Unable to read default input device (CoreAudio error \(status)).")
+    }
+    return deviceID
+}
+
+func setDefaultInputDeviceID(_ deviceID: AudioDeviceID) throws {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID = deviceID
+    let dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectSetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        dataSize,
+        &deviceID
+    )
+    guard status == noErr else {
+        throw ValidationError("Unable to set default input device (CoreAudio error \(status)).")
+    }
+}
+
+func listInputDevices() throws -> [AudioInputDevice] {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    var status = AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &dataSize
+    )
+    guard status == noErr else {
+        throw ValidationError("Unable to list audio devices (CoreAudio error \(status)).")
+    }
+
+    let deviceCount = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+    var deviceIDs = [AudioDeviceID](repeating: 0, count: deviceCount)
+    status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &dataSize,
+        &deviceIDs
+    )
+    guard status == noErr else {
+        throw ValidationError("Unable to list audio devices (CoreAudio error \(status)).")
+    }
+
+    func hasInputChannels(_ deviceID: AudioDeviceID) -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(AudioObjectID(deviceID), &addr, 0, nil, &size)
+        guard status == noErr, size > 0 else { return false }
+
+        let buffer = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(size),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { buffer.deallocate() }
+
+        status = AudioObjectGetPropertyData(AudioObjectID(deviceID), &addr, 0, nil, &size, buffer)
+        guard status == noErr else { return false }
+
+        let bufferList = UnsafeMutableAudioBufferListPointer(buffer.assumingMemoryBound(to: AudioBufferList.self))
+        let channels = bufferList.reduce(0) { $0 + Int($1.mNumberChannels) }
+        return channels > 0
+    }
+
+    func readStringProperty(_ selector: AudioObjectPropertySelector, deviceID: AudioDeviceID) -> String? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        var value: Unmanaged<CFString>?
+        let status = AudioObjectGetPropertyData(AudioObjectID(deviceID), &addr, 0, nil, &dataSize, &value)
+        guard status == noErr, let value else { return nil }
+        return value.takeUnretainedValue() as String
+    }
+
+    var devices: [AudioInputDevice] = []
+    for id in deviceIDs where hasInputChannels(id) {
+        guard let uid = readStringProperty(kAudioDevicePropertyDeviceUID, deviceID: id),
+              let name = readStringProperty(kAudioObjectPropertyName, deviceID: id) else {
+            continue
+        }
+        devices.append(AudioInputDevice(id: id, uid: uid, name: name))
+    }
+
+    return devices.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 }
 
 // AVFoundation types are not Sendable; keep them on MainActor.
@@ -196,6 +328,18 @@ struct MicRec: AsyncParsableCommand {
     @Flag(help: "Print machine-readable JSON to stdout.")
     var json = false
 
+    @Flag(help: "List available input devices and exit.")
+    var listDevices = false
+
+    @Flag(help: "List available audio formats and exit.")
+    var listFormats = false
+
+    @Flag(help: "List available encoder qualities and exit.")
+    var listQualities = false
+
+    @Option(help: "Input device UID or name to use for recording.")
+    var device: String?
+
     @Option(help: "Sample rate in Hz. Default: 44100.")
     var sampleRate: Double?
 
@@ -311,6 +455,69 @@ struct MicRec: AsyncParsableCommand {
 
     mutating func run() async throws {
         do {
+            if listFormats {
+                let formats = AudioFormat.allCases
+                if json {
+                    struct FormatOutput: Codable {
+                        let format: String
+                        let fileExtension: String
+                    }
+                    let out = formats.map { FormatOutput(format: $0.rawValue, fileExtension: $0.fileExtension) }
+                    let data = try JSONEncoder().encode(out)
+                    FileHandle.standardOutput.write(data)
+                    FileHandle.standardOutput.write(Data("\n".utf8))
+                } else {
+                    for format in formats {
+                        print("\(format.rawValue)\t.\(format.fileExtension)")
+                    }
+                }
+                return
+            }
+
+            if listQualities {
+                let qualities = AudioQuality.allCases.map(\.rawValue)
+                if json {
+                    let data = try JSONEncoder().encode(qualities)
+                    FileHandle.standardOutput.write(data)
+                    FileHandle.standardOutput.write(Data("\n".utf8))
+                } else {
+                    for quality in qualities {
+                        print(quality)
+                    }
+                }
+                return
+            }
+
+            if listDevices {
+                let devices = try listInputDevices()
+                let defaultID = try? defaultInputDeviceID()
+                if json {
+                    struct DeviceOutput: Codable {
+                        let id: UInt32
+                        let uid: String
+                        let name: String
+                        let isDefault: Bool
+                    }
+                    let out = devices.map {
+                        DeviceOutput(
+                            id: $0.id,
+                            uid: $0.uid,
+                            name: $0.name,
+                            isDefault: $0.id == defaultID
+                        )
+                    }
+                    let data = try JSONEncoder().encode(out)
+                    FileHandle.standardOutput.write(data)
+                    FileHandle.standardOutput.write(Data("\n".utf8))
+                } else {
+                    for device in devices {
+                        let marker = (device.id == defaultID) ? "*" : " "
+                        print("\(marker) \(device.name)\t\(device.uid)")
+                    }
+                }
+                return
+            }
+
             let granted = await requestMicrophonePermission()
             guard granted else {
                 log("""
@@ -321,6 +528,30 @@ struct MicRec: AsyncParsableCommand {
                   System Settings → Privacy & Security → Microphone → (Terminal / iTerm / your terminal)
                 """)
                 throw ExitCode(2)
+            }
+
+            var restoreDeviceID: AudioDeviceID?
+            if let device {
+                let devices = try listInputDevices()
+                let matches = devices.filter {
+                    $0.uid.caseInsensitiveCompare(device) == .orderedSame ||
+                    $0.name.range(of: device, options: .caseInsensitive) != nil
+                }
+                if matches.count == 1, let match = matches.first {
+                    restoreDeviceID = try defaultInputDeviceID()
+                    try setDefaultInputDeviceID(match.id)
+                } else if matches.isEmpty {
+                    throw ValidationError("No input device matches '\(device)'. Use --list-devices to see available devices.")
+                } else {
+                    let names = matches.map { $0.name }.joined(separator: ", ")
+                    throw ValidationError("Multiple devices match '\(device)': \(names). Please be more specific.")
+                }
+            }
+
+            defer {
+                if let restoreDeviceID {
+                    try? setDefaultInputDeviceID(restoreDeviceID)
+                }
             }
 
             let settings = buildSettings()

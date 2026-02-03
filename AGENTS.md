@@ -35,6 +35,11 @@ swift build
   - `--name` supports strftime tokens plus `{uuid}`.
   - `--overwrite` allows replacing an existing file.
   - `--json` prints structured output to stdout instead of just the path.
+- Device handling:
+  - `--list-devices` prints available input devices (use `--json` for machine output).
+  - `--device` can set a temporary default input device for the recording.
+- Discovery flags:
+  - `--list-formats` and `--list-qualities` print available values and exit.
 
 ## Testing notes
 
