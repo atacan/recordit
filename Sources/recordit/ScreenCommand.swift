@@ -3,6 +3,7 @@ import AVFoundation
 import VideoToolbox
 import CoreMedia
 import CoreImage
+import CoreGraphics
 import Foundation
 import ScreenCaptureKit
 import ImageIO
@@ -159,6 +160,7 @@ struct ScreenCommand: AsyncParsableCommand {
     var audioChannels: Int?
 
     mutating func run() async throws {
+        ensureWindowServerConnection()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
 
         if listDisplays {
@@ -238,22 +240,26 @@ struct ScreenCommand: AsyncParsableCommand {
 
         let chosenWindow: SCWindow?
         if let window {
-            if let windowID = UInt32(window) {
-                chosenWindow = content.windows.first { $0.windowID == windowID }
-            } else {
-                let matches = content.windows.filter {
-                    let title = $0.title ?? ""
-                    let app = $0.owningApplication?.applicationName ?? ""
-                    return title.range(of: window, options: .caseInsensitive) != nil ||
-                        app.range(of: window, options: .caseInsensitive) != nil
+            let query = window.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !query.isEmpty else {
+                throw ValidationError("Window selector cannot be empty.")
+            }
+            if let windowID = UInt32(query) {
+                guard let resolved = content.windows.first(where: { $0.windowID == windowID }) else {
+                    throw ValidationError("No window with ID \(windowID). Use --list-windows to see available windows.")
                 }
+                chosenWindow = resolved
+            } else {
+                let matches = matchingWindows(content.windows, query: query)
                 if matches.count == 1 {
                     chosenWindow = matches.first
                 } else if matches.isEmpty {
                     throw ValidationError("No window matches '\(window)'. Use --list-windows to see available windows.")
+                } else if let resolved = resolveWindowMatch(matches, query: query) {
+                    chosenWindow = resolved
                 } else {
-                    let names = matches.compactMap { $0.title ?? $0.owningApplication?.applicationName }.joined(separator: ", ")
-                    throw ValidationError("Multiple windows match '\(window)': \(names). Please be more specific.")
+                    let names = matches.map(windowLabel).joined(separator: ", ")
+                    throw ValidationError("Multiple windows match '\(window)': \(names). Please be more specific or use --window <id>.")
                 }
             }
         } else {
@@ -348,6 +354,7 @@ struct ScreenCommand: AsyncParsableCommand {
 
         let filter: SCContentFilter
         if let window = chosenWindow {
+            ensureWindowServerConnection()
             filter = SCContentFilter(desktopIndependentWindow: window)
         } else if let display = chosenDisplay {
             filter = SCContentFilter(display: display, excludingWindows: [])
@@ -637,6 +644,92 @@ struct ScreenCommand: AsyncParsableCommand {
             break
         }
     }
+
+    private func normalizedTitle(_ window: SCWindow) -> String {
+        (window.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func normalizedApp(_ window: SCWindow) -> String {
+        (window.owningApplication?.applicationName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func matchingWindows(_ windows: [SCWindow], query: String) -> [SCWindow] {
+        let appExactMatches = windows.filter {
+            let app = normalizedApp($0)
+            return !app.isEmpty && app.caseInsensitiveCompare(query) == .orderedSame
+        }
+        if !appExactMatches.isEmpty {
+            return appExactMatches
+        }
+
+        let titleMatches = windows.filter {
+            let title = normalizedTitle($0)
+            return !title.isEmpty && title.range(of: query, options: .caseInsensitive) != nil
+        }
+        if !titleMatches.isEmpty {
+            return titleMatches
+        }
+
+        let appSubstringMatches = windows.filter {
+            let app = normalizedApp($0)
+            return !app.isEmpty && app.range(of: query, options: .caseInsensitive) != nil
+        }
+        return appSubstringMatches
+    }
+
+    private func isVisibleWindow(_ window: SCWindow) -> Bool {
+        guard window.isOnScreen else { return false }
+        let size = window.frame.size
+        return size.width > 1 && size.height > 1
+    }
+
+    private func windowArea(_ window: SCWindow) -> Double {
+        Double(window.frame.size.width * window.frame.size.height)
+    }
+
+    private func resolveWindowMatch(_ matches: [SCWindow], query: String) -> SCWindow? {
+        let titleMatches = matches.filter { normalizedTitle($0).range(of: query, options: .caseInsensitive) != nil }
+        if titleMatches.count == 1 {
+            return titleMatches.first
+        }
+
+        let appExactMatches = matches.filter { normalizedApp($0).caseInsensitiveCompare(query) == .orderedSame }
+        let baseMatches = appExactMatches.isEmpty ? matches : appExactMatches
+
+        let visibleMatches = baseMatches.filter { isVisibleWindow($0) }
+        if visibleMatches.count == 1 {
+            return visibleMatches.first
+        }
+
+        let activeMatches = visibleMatches.filter { $0.isActive }
+        if activeMatches.count == 1 {
+            return activeMatches.first
+        }
+
+        if !visibleMatches.isEmpty {
+            let maxArea = visibleMatches.map { windowArea($0) }.max() ?? 0
+            let largestMatches = visibleMatches.filter { windowArea($0) == maxArea }
+            if largestMatches.count == 1 {
+                return largestMatches.first
+            }
+        }
+
+        return nil
+    }
+
+    private func windowLabel(_ window: SCWindow) -> String {
+        let app = normalizedApp(window)
+        let title = normalizedTitle(window)
+        let appLabel = app.isEmpty ? "(unknown app)" : app
+        let titleLabel = title.isEmpty ? "(untitled)" : title
+        let onScreen = window.isOnScreen ? "on" : "off"
+        return "\(window.windowID) \(appLabel) — \(titleLabel) [\(onScreen)]"
+    }
+}
+
+private func ensureWindowServerConnection() {
+    var count: UInt32 = 0
+    _ = CGGetActiveDisplayList(0, nil, &count)
 }
 
 private func scaledSize(base: CGSize, scale: Double) -> CGSize {
