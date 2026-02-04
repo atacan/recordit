@@ -291,7 +291,6 @@ struct ScreenCommand: AsyncParsableCommand {
         }
 
         let regionRect = try region.map { try parseRegion($0, baseSize: baseSize) }
-        let targetSize = scaledSize(base: regionRect?.size ?? baseSize, scale: scale ?? 1.0)
         let videoCodec = codec ?? .h264
 
         let filter: SCContentFilter
@@ -304,8 +303,15 @@ struct ScreenCommand: AsyncParsableCommand {
         }
 
         let config = SCStreamConfiguration()
-        config.width = Int(targetSize.width.rounded())
-        config.height = Int(targetSize.height.rounded())
+        let pointScale = Double(filter.pointPixelScale)
+        let regionPointsSize = regionRect?.size ?? baseSize
+        let regionPixelSize = CGSize(
+            width: regionPointsSize.width * pointScale,
+            height: regionPointsSize.height * pointScale
+        )
+        let targetPixelSize = scaledSize(base: regionPixelSize, scale: scale ?? 1.0)
+        config.width = evenPixelInt(targetPixelSize.width)
+        config.height = evenPixelInt(targetPixelSize.height)
         config.pixelFormat = kCVPixelFormatType_32BGRA
         config.queueDepth = 5
         config.showsCursor = !hideCursor
@@ -508,6 +514,12 @@ struct ScreenCommand: AsyncParsableCommand {
 
 private func scaledSize(base: CGSize, scale: Double) -> CGSize {
     CGSize(width: max(1, base.width * scale), height: max(1, base.height * scale))
+}
+
+private func evenPixelInt(_ value: Double) -> Int {
+    let rounded = Int(value.rounded())
+    let adjusted = (rounded % 2 == 0) ? rounded : rounded + 1
+    return max(2, adjusted)
 }
 
 private func parseRegion(_ spec: String, baseSize: CGSize) throws -> CGRect {
