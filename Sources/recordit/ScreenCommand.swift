@@ -379,14 +379,6 @@ struct ScreenCommand: AsyncParsableCommand {
         if let bitRate, videoCodec != .prores {
             compression[AVVideoAverageBitRateKey] = bitRate
         }
-        var outputSettings: [String: Any] = [
-            AVVideoCodecKey: videoCodec.avType,
-            AVVideoWidthKey: config.width,
-            AVVideoHeightKey: config.height
-        ]
-        if !compression.isEmpty {
-            outputSettings[AVVideoCompressionPropertiesKey] = compression
-        }
 
         let shouldSplit = split != nil
         let overallDeadline = duration.map { Date().addingTimeInterval($0) }
@@ -425,9 +417,10 @@ struct ScreenCommand: AsyncParsableCommand {
             let recorder = try ScreenRecorder(
                 outputURL: outputURL,
                 fileType: videoCodec.fileType,
+                videoCodec: videoCodec.avType,
                 filter: filter,
                 configuration: config,
-                outputSettings: outputSettings,
+                compression: compression,
                 audioSettings: audioSettings,
                 captureAudio: captureAudio
             )
@@ -806,48 +799,36 @@ private func waitForStopKeyOrDuration(
 
 final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private let stream: SCStream
-    private let writer: AVAssetWriter
-    private let input: AVAssetWriterInput
-    private let audioInput: AVAssetWriterInput?
+    private var writer: AVAssetWriter?
+    private var input: AVAssetWriterInput?
+    private var audioInput: AVAssetWriterInput?
     private let queue = DispatchQueue(label: "recordit.screen.capture")
     private let stateLock = NSLock()
     private var paused = false
+    private let outputURL: URL
+    private let fileType: AVFileType
+    private let videoCodec: AVVideoCodecType
+    private let compression: [String: Any]
+    private let audioSettings: [String: Any]?
+    private let captureAudio: Bool
 
     init(
         outputURL: URL,
         fileType: AVFileType,
+        videoCodec: AVVideoCodecType,
         filter: SCContentFilter,
         configuration: SCStreamConfiguration,
-        outputSettings: [String: Any],
+        compression: [String: Any],
         audioSettings: [String: Any]?,
         captureAudio: Bool
     ) throws {
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
-
-        writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
-        input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
-        input.expectsMediaDataInRealTime = true
-        if writer.canAdd(input) {
-            writer.add(input)
-        } else {
-            throw NSError(domain: "recordit.screen", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Unable to configure video writer input."
-            ])
-        }
-
-        if captureAudio, let audioSettings {
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            audioInput.expectsMediaDataInRealTime = true
-            if writer.canAdd(audioInput) {
-                writer.add(audioInput)
-                self.audioInput = audioInput
-            } else {
-                self.audioInput = nil
-                log("Unable to add audio writer input; continuing without audio.")
-            }
-        } else {
-            audioInput = nil
-        }
+        self.outputURL = outputURL
+        self.fileType = fileType
+        self.videoCodec = videoCodec
+        self.compression = compression
+        self.audioSettings = audioSettings
+        self.captureAudio = captureAudio
 
         super.init()
 
@@ -863,11 +844,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
 
     func stop() async throws {
         try await stream.stopCapture()
+        let (writer, input, audioInput) = queue.sync { (self.writer, self.input, self.audioInput) }
+
+        guard let writer, let input else { return }
         input.markAsFinished()
         audioInput?.markAsFinished()
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             writer.finishWriting {
-                if let error = self.writer.error {
+                if let error = writer.error {
                     cont.resume(throwing: error)
                 } else {
                     cont.resume(returning: ())
@@ -881,11 +865,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
         if isPaused() { return }
 
-        if writer.status == .unknown {
-            let startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            writer.startWriting()
-            writer.startSession(atSourceTime: startTime)
+        if type == .screen {
+            if !ensureWriter(sampleBuffer: sampleBuffer) {
+                return
+            }
         }
+
+        let (writer, input, audioInput) = queue.sync { (self.writer, self.input, self.audioInput) }
+        guard let writer, let input else { return }
 
         if writer.status == .failed {
             log("Writer failed: \(writer.error?.localizedDescription ?? "unknown error")")
@@ -898,7 +885,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
                     log("Failed to append video buffer: \(writer.error?.localizedDescription ?? "unknown error")")
                 }
             }
-        } else if type == .audio, let audioInput {
+        } else if type == .audio, let audioInput, writer.status != .unknown {
             if audioInput.isReadyForMoreMediaData {
                 if !audioInput.append(sampleBuffer) {
                     log("Failed to append audio buffer: \(writer.error?.localizedDescription ?? "unknown error")")
@@ -918,5 +905,64 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         let value = paused
         stateLock.unlock()
         return value
+    }
+
+    private func ensureWriter(sampleBuffer: CMSampleBuffer) -> Bool {
+        if writer != nil {
+            return true
+        }
+
+        guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+            return false
+        }
+
+        let width = CVPixelBufferGetWidth(imageBuffer)
+        let height = CVPixelBufferGetHeight(imageBuffer)
+
+        var outputSettings: [String: Any] = [
+            AVVideoCodecKey: videoCodec,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        if !compression.isEmpty {
+            outputSettings[AVVideoCompressionPropertiesKey] = compression
+        }
+
+        do {
+            let writer = try AVAssetWriter(outputURL: outputURL, fileType: fileType)
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+            input.expectsMediaDataInRealTime = true
+            if writer.canAdd(input) {
+                writer.add(input)
+            } else {
+                log("Unable to configure video writer input.")
+                return false
+            }
+
+            var audioInput: AVAssetWriterInput?
+            if captureAudio, let audioSettings {
+                let audio = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                audio.expectsMediaDataInRealTime = true
+                if writer.canAdd(audio) {
+                    writer.add(audio)
+                    audioInput = audio
+                } else {
+                    log("Unable to add audio writer input; continuing without audio.")
+                }
+            }
+
+            self.writer = writer
+            self.input = input
+            self.audioInput = audioInput
+
+            let startTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            writer.startWriting()
+            writer.startSession(atSourceTime: startTime)
+        } catch {
+            log("Failed to initialize writer: \(error)")
+            return false
+        }
+
+        return true
     }
 }
