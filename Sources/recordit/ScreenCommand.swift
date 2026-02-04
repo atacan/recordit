@@ -1,5 +1,6 @@
 import ArgumentParser
 import AVFoundation
+import VideoToolbox
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -309,7 +310,15 @@ struct ScreenCommand: AsyncParsableCommand {
             width: regionPointsSize.width * pointScale,
             height: regionPointsSize.height * pointScale
         )
-        let targetPixelSize = scaledSize(base: regionPixelSize, scale: scale ?? 1.0)
+        var targetPixelSize = scaledSize(base: regionPixelSize, scale: scale ?? 1.0)
+        if videoCodec == .h264 {
+            let maxDimension = max(targetPixelSize.width, targetPixelSize.height)
+            if maxDimension > 4096 {
+                let factor = 4096.0 / maxDimension
+                targetPixelSize = scaledSize(base: targetPixelSize, scale: factor)
+                log("H.264 max dimension is 4096; downscaling to \(Int(targetPixelSize.width))x\(Int(targetPixelSize.height)). Use --codec hevc/prores or --scale to control.")
+            }
+        }
         config.width = evenPixelInt(targetPixelSize.width)
         config.height = evenPixelInt(targetPixelSize.height)
         config.pixelFormat = kCVPixelFormatType_32BGRA
@@ -364,7 +373,9 @@ struct ScreenCommand: AsyncParsableCommand {
         }
         let effectiveAudioMode: ScreenAudio = captureAudio ? audioMode : .none
 
-        var compression: [String: Any] = [:]
+        var compression: [String: Any] = [
+            kVTCompressionPropertyKey_RealTime as String: true
+        ]
         if let bitRate, videoCodec != .prores {
             compression[AVVideoAverageBitRateKey] = bitRate
         }
