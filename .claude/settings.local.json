@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(git mv:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:docs.github.com)"
     ]
   }
 }

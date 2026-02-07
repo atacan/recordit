@@ -2,13 +2,31 @@
 
 A macOS CLI that records audio, screen, or camera output and prints the output file path.
 
-## Build
+## Install
+
+```bash
+brew install atacan/tap/record
+```
+
+## AI Agent Skill
+
+Install the skill for AI agents that have access to the terminal:
+
+```bash
+npx skills add https://github.com/atacan/record --skill record
+```
+
+For [OpenClaw](https://clawhub.ai/atacan/record):
+
+```bash
+https://clawhub.ai/atacan/record
+```
+
+## Build from Source
 
 ```bash
 swift build
 ```
-
-## Run
 
 ```bash
 .build/arm64-apple-macosx/debug/record audio
