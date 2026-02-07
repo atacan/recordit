@@ -13,3 +13,5 @@
 DerivedData/
 Package.resolved
 xcuserdata/
+*.tar.gz
+.claude/settings.local.json

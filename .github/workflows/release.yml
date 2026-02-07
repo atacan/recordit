@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # macOS builds (arm64 + x86_64)
+  # ---------------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-26
+    strategy:
+      matrix:
+        arch: [arm64, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print Swift version
+        run: swift --version
+
+      - name: Build (${{ matrix.arch }})
+        run: swift build -c release --arch ${{ matrix.arch }}
+
+      - name: Copy and strip binary
+        run: |
+          BIN_PATH="$(swift build -c release --arch ${{ matrix.arch }} --show-bin-path)/record"
+          SUFFIX=${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+          cp "$BIN_PATH" "record-macos-${SUFFIX}"
+          strip "record-macos-${SUFFIX}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: record-macos-${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+          path: record-macos-*
+
+  # ---------------------------------------------------------------------------
+  # Create release + push Homebrew formula
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [build-macos]
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create archives
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          mkdir -p archives
+
+          for arch in arm64 amd64; do
+            src="artifacts/record-macos-${arch}/record-macos-${arch}"
+            staging=$(mktemp -d)
+            cp "$src" "$staging/record"
+            chmod +x "$staging/record"
+            tar -czf "archives/record-${VERSION}-macos-${arch}.tar.gz" -C "$staging" record
+            rm -rf "$staging"
+          done
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" archives/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+      - name: Compute checksums and generate formula
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          TAG="$GITHUB_REF_NAME"
+          REPO="${{ github.repository }}"
+
+          SHA_ARM64=$(shasum -a 256 "archives/record-${VERSION}-macos-arm64.tar.gz" | awk '{print $1}')
+          SHA_AMD64=$(shasum -a 256 "archives/record-${VERSION}-macos-amd64.tar.gz" | awk '{print $1}')
+
+          mkdir -p formula
+          cat > formula/record.rb <<RUBY
+          class Record < Formula
+            desc "Record audio, screen, or camera output from the terminal"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${REPO}/releases/download/${TAG}/record-${VERSION}-macos-arm64.tar.gz"
+                sha256 "${SHA_ARM64}"
+              end
+              on_intel do
+                url "https://github.com/${REPO}/releases/download/${TAG}/record-${VERSION}-macos-amd64.tar.gz"
+                sha256 "${SHA_AMD64}"
+              end
+            end
+
+            def install
+              bin.install "record"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/record --version")
+            end
+          end
+          RUBY
+
+      - name: Push formula to homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/atacan/homebrew-tap.git" /tmp/homebrew-tap
+          mkdir -p /tmp/homebrew-tap/Formula
+          cp formula/record.rb /tmp/homebrew-tap/Formula/record.rb
+          cd /tmp/homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/record.rb
+          git commit -m "record ${VERSION}"
+          git push
