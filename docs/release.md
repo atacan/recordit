@@ -64,16 +64,28 @@ brew install atacan/tap/record
 brew upgrade record
 ```
 
-### Local alternative
+### Local release with `release.sh`
 
-A `release.sh` script is available for doing the full release locally:
+The `release.sh` script handles the entire release from your machine — version bump, build, commit, tag, push, GitHub release, and Homebrew formula update.
+
+**Prerequisites:**
+- You must be on the `main` branch
+- The working tree must be clean (all changes committed and pushed)
+- Merge any feature branches into `main` before running the script
 
 ```bash
-./release.sh X.Y.Z              # full release: build, tag, push, create release, update formula
-./release.sh --formula-only X.Y.Z  # regenerate just the Homebrew formula from an existing release
+# 1. Make sure you're on main with everything merged
+git checkout main
+git pull origin main
+
+# 2. Run the release (the script bumps appVersion automatically)
+./release.sh X.Y.Z
 ```
 
-The script updates `appVersion` in `Sources/record/record.swift` automatically via `sed`, so you don't need to edit the file manually when using it.
+To regenerate just the Homebrew formula from an existing release:
+```bash
+./release.sh --formula-only X.Y.Z
+```
 
 ### First-time setup
 
