@@ -1,4 +1,6 @@
 import Foundation
+import CoreMedia
+import ScreenCaptureKit
 import Testing
 @testable import record
 
@@ -93,4 +95,23 @@ private func parseAudioCommand(_ arguments: [String]) throws -> AudioCommand {
 
     let boosted = StreamAudioPipeline.mixSample(system: 0.4, microphone: 0.2, systemGain: 2.0)
     #expect(abs(boosted - 0.5) < 0.0001)
+}
+
+@Test func screenFrameStatusGuardKeepsOnlyCompleteFrames() {
+    #expect(ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: nil))
+    #expect(ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: SCFrameStatus.complete.rawValue))
+    #expect(!ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: SCFrameStatus.idle.rawValue))
+    #expect(!ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: SCFrameStatus.started.rawValue))
+    #expect(ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: Int.max))
+}
+
+@Test func screenFrameTimestampGuardRequiresStrictIncrease() {
+    let t1 = CMTime(value: 1_000, timescale: 1_000)
+    let t2 = CMTime(value: 1_001, timescale: 1_000)
+    let t0 = CMTime(value: 999, timescale: 1_000)
+
+    #expect(ScreenFrameGuards.shouldAppendVideoFrame(lastVideoPTS: nil, currentPTS: t1))
+    #expect(ScreenFrameGuards.shouldAppendVideoFrame(lastVideoPTS: t1, currentPTS: t2))
+    #expect(!ScreenFrameGuards.shouldAppendVideoFrame(lastVideoPTS: t1, currentPTS: t1))
+    #expect(!ScreenFrameGuards.shouldAppendVideoFrame(lastVideoPTS: t1, currentPTS: t0))
 }

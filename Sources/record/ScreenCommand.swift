@@ -1186,7 +1186,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private var loggedWriterFailure = false
     private var isStopping = false
     private var lastVideoPTS: CMTime?
-    private var loggedNonMonotonicVideoPTS = false
 
     init(
         outputURL: URL,
@@ -1297,7 +1296,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         }
 
         if type == .screen {
-            if !isCompleteScreenFrame(adjustedBuffer) {
+            let frameStatusRawValue = screenFrameStatusRawValue(from: adjustedBuffer)
+            if !ScreenFrameGuards.shouldAppendVideoFrame(frameStatusRawValue: frameStatusRawValue) {
                 return
             }
             writerLock.lock()
@@ -1317,11 +1317,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
                 return
             }
             let pts = CMSampleBufferGetPresentationTimeStamp(adjustedBuffer)
-            if let lastVideoPTS, CMTimeCompare(pts, lastVideoPTS) <= 0 {
-                if !loggedNonMonotonicVideoPTS {
-                    loggedNonMonotonicVideoPTS = true
-                    log("Skipping non-monotonic video frame timestamp while recording.")
-                }
+            if !ScreenFrameGuards.shouldAppendVideoFrame(lastVideoPTS: lastVideoPTS, currentPTS: pts) {
                 return
             }
             if input.isReadyForMoreMediaData, !input.append(adjustedBuffer) {
@@ -1472,18 +1468,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         return true
     }
 
-    private func isCompleteScreenFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+    private func screenFrameStatusRawValue(from sampleBuffer: CMSampleBuffer) -> Int? {
         guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
             sampleBuffer,
             createIfNecessary: false
         ) as? [[SCStreamFrameInfo: Any]],
-        let attachments = attachmentsArray.first,
-        let statusRawValue = attachments[.status] as? Int,
-        let status = SCFrameStatus(rawValue: statusRawValue)
-        else {
-            return true
-        }
-        return status == .complete
+        let attachments = attachmentsArray.first
+        else { return nil }
+        return attachments[.status] as? Int
     }
 
     private func adjustSampleBuffer(_ sampleBuffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
@@ -1531,5 +1523,25 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
             return sampleBuffer
         }
         return adjusted
+    }
+}
+
+enum ScreenFrameGuards {
+    static func shouldAppendVideoFrame(frameStatusRawValue: Int?) -> Bool {
+        guard let frameStatusRawValue else { return true }
+        guard let status = SCFrameStatus(rawValue: frameStatusRawValue) else { return true }
+        switch status {
+        case .complete:
+            return true
+        case .idle, .blank, .suspended, .started, .stopped:
+            return false
+        @unknown default:
+            return true
+        }
+    }
+
+    static func shouldAppendVideoFrame(lastVideoPTS: CMTime?, currentPTS: CMTime) -> Bool {
+        guard let lastVideoPTS else { return true }
+        return CMTimeCompare(currentPTS, lastVideoPTS) == 1
     }
 }
