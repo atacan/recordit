@@ -201,6 +201,8 @@ record camera --audio --duration 5
 - Microphone permission is required for audio recording. In macOS: System Settings -> Privacy & Security -> Microphone -> enable your terminal app.
 - Screen recording permission is required for `record audio --source system|both`. In macOS: System Settings -> Privacy & Security -> Screen Recording -> enable your terminal app.
 - Screen recording permission is required for screen capture. In macOS: System Settings -> Privacy & Security -> Screen Recording -> enable your terminal app.
+- Microphone permission is required for `record screen --audio mic|both`. In macOS: System Settings -> Privacy & Security -> Microphone -> enable your terminal app.
+- `--system-gain` boosts system audio before mixing/encoding. Values that are too high can clip and distort; start around `1.2` to `2.0`.
 - Camera permission is required for camera capture. In macOS: System Settings -> Privacy & Security -> Camera -> enable your terminal app.
 - Microphone permission is required for camera capture when using `--audio`.
 - Stopping with `S` requires a real TTY (Terminal/iTerm). IDE consoles may not deliver single-key input.

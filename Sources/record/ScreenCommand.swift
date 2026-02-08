@@ -1161,13 +1161,14 @@ private func waitForStopKeyOrDuration(
 }
 
 final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
-    private static let queueKey = DispatchSpecificKey<UInt8>()
     private let stream: SCStream
     private var writer: AVAssetWriter?
     private var input: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
-    private let queue = DispatchQueue(label: "record.screen.capture")
+    private let videoQueue = DispatchQueue(label: "record.screen.capture.video")
+    private let audioQueue = DispatchQueue(label: "record.screen.capture.audio")
     private let stateLock = NSLock()
+    private let writerLock = NSLock()
     private var paused = false
     private var pauseStartTime: CMTime?
     private var pauseOffset = CMTime.zero
@@ -1182,6 +1183,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private var sessionStartTime: CMTime?
     private var receivedSystemAudio = false
     private var receivedMicrophoneAudio = false
+    private var loggedWriterFailure = false
+    private var isStopping = false
+    private var lastVideoPTS: CMTime?
+    private var loggedNonMonotonicVideoPTS = false
 
     init(
         outputURL: URL,
@@ -1198,7 +1203,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         audioSampleRate: Int,
         audioChannels: Int
     ) throws {
-        queue.setSpecific(key: Self.queueKey, value: 1)
         stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
         self.outputURL = outputURL
         self.fileType = fileType
@@ -1232,12 +1236,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
 
         super.init()
 
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
         if captureSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
         }
         if captureMicrophoneAudio {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue)
+            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: audioQueue)
         }
     }
 
@@ -1246,21 +1250,30 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     }
 
     func stop() async throws {
+        writerLock.withLock {
+            isStopping = true
+        }
         try await stream.stopCapture()
+        // SCStream may still have in-flight callbacks queued; drain them before
+        // marking writer inputs finished.
+        videoQueue.sync {}
+        audioQueue.sync {}
         if captureMicrophoneAudio && !receivedMicrophoneAudio {
             log("Warning: no microphone samples were received during screen capture.")
         }
         if captureSystemAudio && !receivedSystemAudio {
             log("Warning: no system audio samples were received during screen capture.")
         }
-        let (writer, input, audioInput) = accessWriter { (self.writer, self.input, self.audioInput) }
-
-        guard let writer, let input else { return }
-        input.markAsFinished()
-        audioInput?.markAsFinished()
+        let tuple = writerLock.withLock {
+            let tuple = (self.writer, self.input, self.audioInput)
+            tuple.1?.markAsFinished()
+            tuple.2?.markAsFinished()
+            return tuple
+        }
+        guard tuple.0 != nil else { return }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            writer.finishWriting { [self] in
-                let error = accessWriter { self.writer?.error }
+            self.writer?.finishWriting { [self] in
+                let error = writerLock.withLock { self.writer?.error }
                 if let error {
                     cont.resume(throwing: error)
                 } else {
@@ -1284,29 +1297,44 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         }
 
         if type == .screen {
-            if !ensureWriter(sampleBuffer: adjustedBuffer) {
+            if !isCompleteScreenFrame(adjustedBuffer) {
                 return
             }
-        }
-
-        let (writer, input, audioInput) = accessWriter { (self.writer, self.input, self.audioInput) }
-        guard let writer, let input else { return }
-
-        if writer.status == .failed {
-            log("Writer failed: \(writer.error?.localizedDescription ?? "unknown error")")
-            return
-        }
-
-        if type == .screen {
+            writerLock.lock()
+            defer { writerLock.unlock() }
+            if isStopping {
+                return
+            }
+            if !ensureWriterLocked(sampleBuffer: adjustedBuffer) {
+                return
+            }
+            guard let writer, let input else { return }
+            if writer.status == .failed {
+                if !loggedWriterFailure {
+                    loggedWriterFailure = true
+                    log("Writer failed: \(writer.error?.localizedDescription ?? "unknown error")")
+                }
+                return
+            }
+            let pts = CMSampleBufferGetPresentationTimeStamp(adjustedBuffer)
+            if let lastVideoPTS, CMTimeCompare(pts, lastVideoPTS) <= 0 {
+                if !loggedNonMonotonicVideoPTS {
+                    loggedNonMonotonicVideoPTS = true
+                    log("Skipping non-monotonic video frame timestamp while recording.")
+                }
+                return
+            }
             if input.isReadyForMoreMediaData, !input.append(adjustedBuffer) {
-                log("Failed to append video buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                if !loggedWriterFailure {
+                    loggedWriterFailure = true
+                    log("Failed to append video buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                }
+            } else if input.isReadyForMoreMediaData {
+                lastVideoPTS = pts
             }
             return
         }
 
-        guard let audioInput, writer.status != .unknown else {
-            return
-        }
         guard let audioPipeline else {
             return
         }
@@ -1318,13 +1346,36 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
             receivedMicrophoneAudio = true
         }
         let mixedBuffers = audioPipeline.append(sampleBuffer: adjustedBuffer, source: source)
+
+        writerLock.lock()
+        defer { writerLock.unlock() }
+        if isStopping {
+            return
+        }
+        guard let writer, let audioInput else {
+            return
+        }
+        guard writer.status != .unknown else {
+            return
+        }
+        if writer.status == .failed {
+            if !loggedWriterFailure {
+                loggedWriterFailure = true
+                log("Writer failed: \(writer.error?.localizedDescription ?? "unknown error")")
+            }
+            return
+        }
+
         for mixedBuffer in mixedBuffers {
             let pts = CMSampleBufferGetPresentationTimeStamp(mixedBuffer)
             if let sessionStartTime, CMTimeCompare(pts, sessionStartTime) < 0 {
                 continue
             }
             if audioInput.isReadyForMoreMediaData, !audioInput.append(mixedBuffer) {
-                log("Failed to append audio buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                if !loggedWriterFailure {
+                    loggedWriterFailure = true
+                    log("Failed to append audio buffer: \(writer.error?.localizedDescription ?? "unknown error")")
+                }
                 return
             }
         }
@@ -1361,14 +1412,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         return (value, offset)
     }
 
-    private func accessWriter<T>(_ block: () -> T) -> T {
-        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-            return block()
-        }
-        return queue.sync(execute: block)
-    }
-
-    private func ensureWriter(sampleBuffer: CMSampleBuffer) -> Bool {
+    private func ensureWriterLocked(sampleBuffer: CMSampleBuffer) -> Bool {
         if writer != nil {
             return true
         }
@@ -1426,6 +1470,20 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         }
 
         return true
+    }
+
+    private func isCompleteScreenFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: false
+        ) as? [[SCStreamFrameInfo: Any]],
+        let attachments = attachmentsArray.first,
+        let statusRawValue = attachments[.status] as? Int,
+        let status = SCFrameStatus(rawValue: statusRawValue)
+        else {
+            return true
+        }
+        return status == .complete
     }
 
     private func adjustSampleBuffer(_ sampleBuffer: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {

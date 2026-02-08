@@ -126,7 +126,7 @@ final class StreamAudioPipeline {
             )
         }
         guard let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
+            commonFormat: .pcmFormatInt16,
             sampleRate: Double(sampleRate),
             channels: AVAudioChannelCount(channels),
             interleaved: true
@@ -299,7 +299,14 @@ final class StreamAudioPipeline {
     }
 
     private func makeSampleBuffer(samples: [Float], frameCount: Int, pts: CMTime) -> CMSampleBuffer? {
-        let byteCount = samples.count * MemoryLayout<Float>.size
+        var pcmSamples = [Int16](repeating: 0, count: samples.count)
+        for index in 0..<samples.count {
+            let clamped = max(-1.0, min(1.0, samples[index]))
+            let scaled = clamped * Float(Int16.max)
+            pcmSamples[index] = Int16(scaled.rounded())
+        }
+
+        let byteCount = pcmSamples.count * MemoryLayout<Int16>.size
         var blockBuffer: CMBlockBuffer?
         let createStatus = CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -316,7 +323,7 @@ final class StreamAudioPipeline {
             return nil
         }
 
-        let replaceStatus = samples.withUnsafeBytes { bytes -> OSStatus in
+        let replaceStatus = pcmSamples.withUnsafeBytes { bytes -> OSStatus in
             guard let base = bytes.baseAddress else {
                 return OSStatus(unimpErr)
             }
@@ -455,7 +462,7 @@ final class StreamAudioPipeline {
     }
 
     private func interleavedSamples(from buffer: AVAudioPCMBuffer) -> [Float] {
-        guard buffer.format.commonFormat == .pcmFormatFloat32,
+        guard buffer.format.commonFormat == .pcmFormatInt16,
               buffer.format.isInterleaved,
               let mData = buffer.audioBufferList.pointee.mBuffers.mData else {
             return []
@@ -466,8 +473,9 @@ final class StreamAudioPipeline {
         guard sampleCount > 0 else {
             return []
         }
-        let pointer = mData.assumingMemoryBound(to: Float.self)
-        return Array(UnsafeBufferPointer(start: pointer, count: sampleCount))
+        let pointer = mData.assumingMemoryBound(to: Int16.self)
+        let raw = UnsafeBufferPointer(start: pointer, count: sampleCount)
+        return raw.map { Float($0) / Float(Int16.max) }
     }
 
     private func isSameFormat(lhs: AVAudioFormat, rhs: AVAudioFormat) -> Bool {

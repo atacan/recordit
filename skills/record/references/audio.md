@@ -91,3 +91,4 @@ record audio --duration 5 --json
 - If `--pause-key` and `--resume-key` are the same, the key toggles pause/resume.
 - With `--split --json`, output is NDJSON (one JSON object per chunk).
 - `--source system` and `--source both` require Screen Recording permission.
+- `--system-gain` boosts system audio before mixing/encoding. Large values can clip; start near `1.2` to `2.0`.

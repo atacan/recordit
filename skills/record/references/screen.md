@@ -80,3 +80,9 @@ record screen --split 30 --output /tmp
 record screen --list-displays
 record screen --list-windows --json
 ```
+
+## Notes
+
+- `--audio mic` and `--audio both` require Microphone permission.
+- `--audio system` and `--audio both` require Screen Recording permission.
+- `--system-gain` boosts system audio before mixing/encoding. Large values can clip; start near `1.2` to `2.0`.
