@@ -98,6 +98,9 @@ final class StreamAudioPipeline {
     private var systemQueue: FloatSampleQueue
     private var microphoneQueue: FloatSampleQueue
     private var converters: [StreamAudioSourceKind: ConverterState] = [:]
+    private var loggedPCMFailureSources: Set<StreamAudioSourceKind> = []
+    private var loggedConversionFailureSources: Set<StreamAudioSourceKind> = []
+    private var loggedEmptyConversionSources: Set<StreamAudioSourceKind> = []
 
     init(mode: StreamAudioMixMode, sampleRate: Int, channels: Int) throws {
         guard sampleRate > 0 else {
@@ -161,9 +164,17 @@ final class StreamAudioPipeline {
             return []
         }
         guard let inputBuffer = pcmBuffer(from: sampleBuffer) else {
+            if !loggedPCMFailureSources.contains(source) {
+                loggedPCMFailureSources.insert(source)
+                log("Warning: unable to decode \(source == .system ? "system" : "microphone") audio sample buffer.")
+            }
             return []
         }
         guard let convertedBuffer = convertToTarget(buffer: inputBuffer, source: source) else {
+            if !loggedConversionFailureSources.contains(source) {
+                loggedConversionFailureSources.insert(source)
+                log("Warning: unable to convert \(source == .system ? "system" : "microphone") audio into mix format.")
+            }
             return []
         }
 
@@ -380,10 +391,30 @@ final class StreamAudioPipeline {
             return nil
         }
 
-        do {
-            _ = try converterState.converter.convert(to: output, from: buffer)
-            return output.frameLength > 0 ? output : nil
-        } catch {
+        var consumed = false
+        var convertError: NSError?
+        let status = converterState.converter.convert(to: output, error: &convertError) { _, outStatus in
+            if consumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            consumed = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        switch status {
+        case .haveData, .inputRanDry, .endOfStream:
+            if output.frameLength > 0 {
+                return output
+            }
+            if !loggedEmptyConversionSources.contains(source) {
+                loggedEmptyConversionSources.insert(source)
+                log("Warning: \(source == .system ? "system" : "microphone") audio conversion produced no frames.")
+            }
+            return nil
+        case .error:
+            return nil
+        @unknown default:
             return nil
         }
     }

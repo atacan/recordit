@@ -414,6 +414,7 @@ struct ScreenCommand: AsyncParsableCommand {
         let audioMode = audio ?? .none
         let audioSampleRateValue = audioSampleRate ?? 48_000
         let audioChannelsValue = audioChannels ?? 2
+        var microphoneCaptureDeviceID: String?
         var captureSystemAudio = false
         var captureMicrophoneAudio = false
         var audioSettings: [String: Any]?
@@ -428,7 +429,22 @@ struct ScreenCommand: AsyncParsableCommand {
                     captureSystemAudio = true
                 }
                 if audioMode == .mic || audioMode == .both {
+                    let micGranted = await requestMicrophonePermission()
+                    guard micGranted else {
+                        log("""
+                        Microphone permission not granted.
+
+                        Enable it in:
+                          System Settings → Privacy & Security → Microphone → (Terminal / iTerm / your terminal)
+                        """)
+                        throw ExitCode(2)
+                    }
+                    guard let micID = AVCaptureDevice.default(for: .audio)?.uniqueID else {
+                        throw ValidationError("No default microphone available for capture.")
+                    }
                     config.captureMicrophone = true
+                    config.microphoneCaptureDeviceID = micID
+                    microphoneCaptureDeviceID = micID
                     captureMicrophoneAudio = true
                 }
                 config.sampleRate = audioSampleRateValue
@@ -560,6 +576,7 @@ struct ScreenCommand: AsyncParsableCommand {
                 audioSettings: audioSettings,
                 captureSystemAudio: captureSystemAudio,
                 captureMicrophoneAudio: captureMicrophoneAudio,
+                microphoneCaptureDeviceID: microphoneCaptureDeviceID,
                 audioSampleRate: audioSampleRateValue,
                 audioChannels: audioChannelsValue
             )
@@ -1151,6 +1168,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
     private let captureMicrophoneAudio: Bool
     private let audioPipeline: StreamAudioPipeline?
     private var sessionStartTime: CMTime?
+    private var receivedSystemAudio = false
+    private var receivedMicrophoneAudio = false
 
     init(
         outputURL: URL,
@@ -1162,6 +1181,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         audioSettings: [String: Any]?,
         captureSystemAudio: Bool,
         captureMicrophoneAudio: Bool,
+        microphoneCaptureDeviceID: String?,
         audioSampleRate: Int,
         audioChannels: Int
     ) throws {
@@ -1174,6 +1194,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         self.audioSettings = audioSettings
         self.captureSystemAudio = captureSystemAudio
         self.captureMicrophoneAudio = captureMicrophoneAudio
+        if captureMicrophoneAudio,
+           let microphoneCaptureDeviceID {
+            configuration.microphoneCaptureDeviceID = microphoneCaptureDeviceID
+        }
         if captureSystemAudio || captureMicrophoneAudio {
             let mixMode: StreamAudioMixMode
             if captureSystemAudio && captureMicrophoneAudio {
@@ -1209,6 +1233,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
 
     func stop() async throws {
         try await stream.stopCapture()
+        if captureMicrophoneAudio && !receivedMicrophoneAudio {
+            log("Warning: no microphone samples were received during screen capture.")
+        }
+        if captureSystemAudio && !receivedSystemAudio {
+            log("Warning: no system audio samples were received during screen capture.")
+        }
         let (writer, input, audioInput) = accessWriter { (self.writer, self.input, self.audioInput) }
 
         guard let writer, let input else { return }
@@ -1268,6 +1298,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput, @unchecked Sendable {
         }
 
         let source: StreamAudioSourceKind = (type == .audio) ? .system : .microphone
+        if source == .system {
+            receivedSystemAudio = true
+        } else {
+            receivedMicrophoneAudio = true
+        }
         let mixedBuffers = audioPipeline.append(sampleBuffer: adjustedBuffer, source: source)
         for mixedBuffer in mixedBuffers {
             let pts = CMSampleBufferGetPresentationTimeStamp(mixedBuffer)

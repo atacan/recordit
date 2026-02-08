@@ -543,12 +543,15 @@ final class StreamAudioCaptureRecorder: NSObject, SCStreamOutput, @unchecked Sen
     private let audioPipeline: StreamAudioPipeline
     private let captureSystemAudio: Bool
     private let captureMicrophoneAudio: Bool
+    private var receivedSystemAudio = false
+    private var receivedMicrophoneAudio = false
 
     init(
         outputURL: URL,
         fileType: AVFileType,
         audioSettings: [String: Any],
         mixMode: StreamAudioMixMode,
+        microphoneCaptureDeviceID: String?,
         filter: SCContentFilter,
         displayWidth: Int,
         displayHeight: Int,
@@ -562,6 +565,9 @@ final class StreamAudioCaptureRecorder: NSObject, SCStreamOutput, @unchecked Sen
         configuration.queueDepth = 5
         configuration.capturesAudio = mixMode.capturesSystem
         configuration.captureMicrophone = mixMode.capturesMicrophone
+        if mixMode.capturesMicrophone, let microphoneCaptureDeviceID {
+            configuration.microphoneCaptureDeviceID = microphoneCaptureDeviceID
+        }
         configuration.sampleRate = sampleRate
         configuration.channelCount = channels
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: 30)
@@ -591,6 +597,12 @@ final class StreamAudioCaptureRecorder: NSObject, SCStreamOutput, @unchecked Sen
 
     func stop() async throws {
         try await stream.stopCapture()
+        if captureMicrophoneAudio && !receivedMicrophoneAudio {
+            log("Warning: no microphone samples were received during stream capture.")
+        }
+        if captureSystemAudio && !receivedSystemAudio {
+            log("Warning: no system audio samples were received during stream capture.")
+        }
         let (writer, input) = accessWriter { (self.writer, self.input) }
         guard let writer, let input else { return }
         input.markAsFinished()
@@ -643,6 +655,11 @@ final class StreamAudioCaptureRecorder: NSObject, SCStreamOutput, @unchecked Sen
         }
 
         let source: StreamAudioSourceKind = (type == .audio) ? .system : .microphone
+        if source == .system {
+            receivedSystemAudio = true
+        } else {
+            receivedMicrophoneAudio = true
+        }
         let mixedBuffers = audioPipeline.append(sampleBuffer: adjustedBuffer, source: source)
         let (writer, input) = accessWriter { (self.writer, self.input) }
         guard let writer, let input else { return }
@@ -1414,6 +1431,15 @@ struct AudioCommand: AsyncParsableCommand {
 
                     let filter = SCContentFilter(display: selectedDisplay, excludingWindows: [])
                     let streamSampleRate = Int(resolvedSampleRate.rounded())
+                    let microphoneCaptureDeviceID: String?
+                    if resolvedSource.includesMic {
+                        guard let deviceID = AVCaptureDevice.default(for: .audio)?.uniqueID else {
+                            throw ValidationError("No default microphone available for --source both.")
+                        }
+                        microphoneCaptureDeviceID = deviceID
+                    } else {
+                        microphoneCaptureDeviceID = nil
+                    }
                     let settings = buildStreamSettings(
                         format: resolvedFormat,
                         sampleRate: streamSampleRate,
@@ -1426,6 +1452,7 @@ struct AudioCommand: AsyncParsableCommand {
                         fileType: .m4a,
                         audioSettings: settings,
                         mixMode: resolvedSource.mixMode,
+                        microphoneCaptureDeviceID: microphoneCaptureDeviceID,
                         filter: filter,
                         displayWidth: selectedDisplay.width,
                         displayHeight: selectedDisplay.height,
